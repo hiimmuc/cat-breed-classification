@@ -146,12 +146,12 @@ def save_model(
 
         # Save the model
         torch.save(save_dict, save_path)
-        logger.info(f"Model saved to {save_path}")
+        logger.info(f"Model saved to {os.path.relpath(save_path)}")
     else:
         # Save the entire model
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(model, save_path)
-        logger.info(f"Model saved to {save_path} as a complete model")
+        logger.info(f"Model saved to {os.path.relpath(save_path)} as a complete model")
 
 
 def load_model(
@@ -175,15 +175,17 @@ def load_model(
 
     # Load checkpoint
     if model_config is None:
+        print(f"Loading model from {os.path.relpath(path)} without config")
         model = torch.load(path, map_location=torch.device(device), weights_only=False)
     else:
+        print(f"Loading model from {os.path.relpath(path)} with config: {model_config}")
         checkpoint = torch.load(path, map_location=torch.device(device))
         # Create model
         model = create_model(num_classes=num_classes, model_config=model_config)
         # Load weights
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    logger.info(f"Loaded model from {path}")
+    logger.info(f"Loaded model from {os.path.relpath(path)}")
 
     return model
 

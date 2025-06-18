@@ -265,7 +265,9 @@ def evaluate(args):
         )
 
         if not model_dirs:
-            logger.error(f"No model checkpoint directories found in {checkpoint_dir}")
+            logger.error(
+                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
+            )
             sys.exit(1)
 
         # Use the latest directory
@@ -276,10 +278,12 @@ def evaluate(args):
             model_path = model_dir / "last_state.pth"
 
         if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {model_dir}")
+            logger.error(
+                f"No model checkpoint files found in {os.path.relpath(model_dir)}"
+            )
             sys.exit(1)
 
-    logger.info(f"Using model checkpoint: {model_path}")
+    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
 
     # Load class names
     class_names_path = model_dir / "class_names.json"
@@ -306,7 +310,11 @@ def evaluate(args):
     test_loader = data_loaders["test"]
 
     # Load model
-    model, checkpoint = load_model(path=model_path, num_classes=len(class_names))
+    model = load_model(
+        path=model_path,
+        num_classes=len(class_names),
+        model_config={"backbone": args.backbone, "pretrained": False},
+    )
 
     # Create evaluator
     output_dir = args.output_dir or Path(args.checkpoint_dir) / "evaluation"
@@ -354,7 +362,9 @@ def predict(args):
         )
 
         if not model_dirs:
-            logger.error(f"No model checkpoint directories found in {checkpoint_dir}")
+            logger.error(
+                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
+            )
             sys.exit(1)
 
         # Use the latest directory
@@ -365,10 +375,12 @@ def predict(args):
             model_path = model_dir / "last_state.pth"
 
         if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {model_dir}")
+            logger.error(
+                f"No model checkpoint files found in {os.path.relpath(model_dir)}"
+            )
             sys.exit(1)
 
-    logger.info(f"Using model checkpoint: {model_path}")
+    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
 
     # Load class names
     class_names_path = model_dir / "class_names.json"
@@ -398,7 +410,7 @@ def predict(args):
     # Save or show result
     if args.output:
         fig.savefig(args.output)
-        logger.info(f"Prediction visualization saved to {args.output}")
+        logger.info(f"Prediction visualization saved to {os.path.relpath(args.output)}")
     else:
         import matplotlib.pyplot as plt
 
@@ -430,7 +442,9 @@ def process_video(args):
         )
 
         if not model_dirs:
-            logger.error(f"No model checkpoint directories found in {checkpoint_dir}")
+            logger.error(
+                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
+            )
             sys.exit(1)
 
         # Use the latest directory
@@ -441,10 +455,12 @@ def process_video(args):
             model_path = model_dir / "last_state.pth"
 
         if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {model_dir}")
+            logger.error(
+                f"No model checkpoint files found in {os.path.relpath(model_dir)}"
+            )
             sys.exit(1)
 
-    logger.info(f"Using model checkpoint: {model_path}")
+    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
 
     # Load class names
     class_names_path = model_dir / "class_names.json"
@@ -477,7 +493,7 @@ def process_video(args):
     )
 
     if output:
-        logger.info(f"Processed video saved to {output}")
+        logger.info(f"Processed video saved to {os.path.relpath(output)}")
 
 
 def run_webcam(args):
@@ -496,7 +512,9 @@ def run_webcam(args):
         )
 
         if not model_dirs:
-            logger.error(f"No model checkpoint directories found in {checkpoint_dir}")
+            logger.error(
+                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
+            )
             sys.exit(1)
 
         # Use the latest directory
@@ -507,10 +525,12 @@ def run_webcam(args):
             model_path = model_dir / "last_state.pth"
 
         if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {model_dir}")
+            logger.error(
+                f"No model checkpoint files found in {os.path.relpath(model_dir)}"
+            )
             sys.exit(1)
 
-    logger.info(f"Using model checkpoint: {model_path}")
+    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
 
     # Load class names
     class_names_path = model_dir / "class_names.json"

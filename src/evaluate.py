@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -9,10 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-)
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 
 from utils.visualization import plot_confusion_matrix, print_classification_report
@@ -163,7 +161,9 @@ class Evaluator:
             cm_path = self.output_dir / "confusion_matrix.png"
             cm_fig.savefig(cm_path)
 
-            logger.info(f"Evaluation results saved to {self.output_dir}")
+            logger.info(
+                f"Evaluation results saved to {os.path.relpath(self.output_dir)}"
+            )
 
         return results
 
