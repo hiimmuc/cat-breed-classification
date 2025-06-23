@@ -70,16 +70,22 @@ def parse_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use (cuda or cpu)",
     )
-    parser.add_argument("--log-file", type=str, help="Log file path")
-
-    # Training arguments
+    parser.add_argument(
+        "--log-file", type=str, help="Log file path"
+    )  # Training arguments
     parser.add_argument(
         "--epochs", type=int, default=30, help="Number of training epochs"
     )
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument(
-        "--patience", type=int, default=10, help="Early stopping patience"
+        "--patience", type=int, default=5, help="Early stopping patience"
+    )
+    parser.add_argument(
+        "--use-tensorboard",
+        action="store_true",
+        default=True,
+        help="Enable TensorBoard logging for training visualization",
     )
 
     # Testing/evaluation arguments
@@ -98,14 +104,22 @@ def parse_args():
 def load_and_update_config(args):
     """
     Load configuration from YAML file if specified and update args.
-    Command-line arguments take precedence over YAML configuration.
+    Config file values overwrite default values.
+    Command-line arguments take precedence over config values.
 
     Args:
         args: Command-line arguments
 
     Returns:
-        Updated args
+        Updated args with precedence: CLI args > config values > defaults
     """
+    # Store which CLI args were explicitly provided
+    cli_parser = argparse.ArgumentParser()
+    cli_args, _ = cli_parser.parse_known_args()
+    explicitly_provided = {
+        key: True for key, val in vars(cli_args).items() if val is not None
+    }
+
     if not args.config_path:
         return args
 
@@ -123,10 +137,10 @@ def load_and_update_config(args):
             logger.warning(f"Empty or invalid configuration file: {config_path}")
             return args
 
-        # Create a dictionary from args
+        # Create a dictionary from args for easier manipulation
         args_dict = vars(args)
 
-        # Track which arguments were explicitly set on the command line
+        # Create a parser with default values to check against
         default_parser = argparse.ArgumentParser()
         default_parser.add_argument(
             "command",
@@ -156,7 +170,19 @@ def load_and_update_config(args):
         default_parser.add_argument("--camera-id", type=int, default=0)
 
         default_args = default_parser.parse_args([args.command])
-        default_arg_values = vars(default_args)
+        default_arg_values = vars(
+            default_args
+        )  # Handle special case for training_config.yaml
+        if "training_config.yaml" in str(config_path):
+            # For training configs, we should use the directory containing the config
+            # as the checkpoint_dir if we're in evaluation mode
+            if args.command == "evaluate" and "checkpoint_dir" in config:
+                # Parse the directory this config file is in
+                parent_dir = config_path.parent
+                logger.info(
+                    f"Evaluation using training config: Setting checkpoint directory to {parent_dir}"
+                )
+                args_dict["checkpoint_dir"] = str(parent_dir)
 
         # Map config keys to argument names
         config_to_arg_map = {
@@ -169,30 +195,34 @@ def load_and_update_config(args):
             "device": "device",
             "img_size": "img_size",
             "num_workers": "num_workers",
+            "checkpoint_dir": "checkpoint_dir",
+            "data_dir": "data_dir",
+            "output_dir": "output_dir",
+            "model_path": "model_path",
             "dropout_rate": None,  # Ignore - not a CLI argument
             "pretrained": None,  # Ignore - not a CLI argument
             "num_classes": None,  # Ignore - not a CLI argument
             "optimizer": None,  # Ignore - not a CLI argument
             "scheduler": None,  # Ignore - not a CLI argument
+            "use_tensorboard": "use_tensorboard",  # Map TensorBoard option
         }
 
-        # Update args with values from config, but only if not explicitly set in command line
+        # Apply config values over defaults, but only if not explicitly set in command line
         for config_key, arg_name in config_to_arg_map.items():
-            if arg_name is None:
+            if arg_name is None or arg_name not in args_dict:
                 continue
 
-            if config_key in config and args_dict.get(
-                arg_name
-            ) == default_arg_values.get(arg_name):
+            # Apply config values if available and not explicitly set via CLI
+            if config_key in config and arg_name not in explicitly_provided:
                 logger.debug(
                     f"Setting {arg_name} = {config[config_key]} from config file"
                 )
-                args_dict[arg_name] = config[config_key]
-
-        # Print the configuration used
-        logger.info("Using configuration:")
+                args_dict[arg_name] = config[
+                    config_key
+                ]  # Print the final configuration used
+        logger.info("Final configuration:")
         for key, value in args_dict.items():
-            if key != "command":
+            if key != "command" and key != "config_path":
                 logger.info(f"  {key}: {value}")
 
         return args
@@ -218,7 +248,7 @@ def train(args):
     class_names = data_loaders["class_names"]
 
     # Create model
-    model_config = {"backbone": args.backbone, "pretrained": True, "dropout_rate": 0.5}
+    model_config = {"backbone": args.backbone, "pretrained": True, "dropout_rate": 0.1}
 
     model = create_model(num_classes=len(class_names), model_config=model_config)
 
@@ -228,10 +258,8 @@ def train(args):
     )
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.2, patience=5, min_lr=1e-6
-    )
-
-    # Create trainer
+        optimizer, mode="min", factor=0.2, patience=20, min_lr=1e-6
+    )  # Create trainer
     trainer = CatBreedTrainer(
         model=model,
         train_loader=train_loader,
@@ -240,6 +268,7 @@ def train(args):
         lr_scheduler=scheduler,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
+        use_tensorboard=args.use_tensorboard,
     )
 
     # Train model
@@ -251,11 +280,44 @@ def train(args):
 
 def evaluate(args):
     """Evaluate a model."""
-    # If model_path is provided, use it directly
+    # Check if we're using a training config file as input
+    if args.config_path and "training_config.yaml" in args.config_path:
+        # The checkpoint dir might be the parent directory of the config file
+        config_path = Path(args.config_path)
+        config_dir = config_path.parent
+
+        # Check if this is a training directory with checkpoint files
+        best_model_path = config_dir / "best_state.pth"
+        last_model_path = config_dir / "last_state.pth"
+
+        if os.path.exists(best_model_path):
+            model_path = best_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        elif os.path.exists(last_model_path):
+            model_path = last_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        else:
+            # Fall back to normal path resolution
+            logger.info(
+                "No model found in config directory, using standard model path resolution"
+            )
+            model_path = None
+            model_dir = None
+    else:
+        model_path = None
+        model_dir = None
+
+    # If a specific model_path was provided, use it directly
     if args.model_path and os.path.exists(args.model_path):
         model_path = args.model_path
         model_dir = Path(model_path).parent
-    else:
+    elif not model_path:  # Only search if we didn't already find a model from config
         # Otherwise, find the latest model checkpoint directory
         checkpoint_dir = Path(args.checkpoint_dir)
         model_dirs = sorted(
@@ -348,11 +410,44 @@ def predict(args):
         logger.error(f"Image not found: {image_path}")
         sys.exit(1)
 
-    # If model_path is provided, use it directly
+    # Check if we're using a training config file as input
+    if args.config_path and "training_config.yaml" in args.config_path:
+        # The checkpoint dir might be the parent directory of the config file
+        config_path = Path(args.config_path)
+        config_dir = config_path.parent
+
+        # Check if this is a training directory with checkpoint files
+        best_model_path = config_dir / "best_state.pth"
+        last_model_path = config_dir / "last_state.pth"
+
+        if os.path.exists(best_model_path):
+            model_path = best_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        elif os.path.exists(last_model_path):
+            model_path = last_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        else:
+            # Fall back to normal path resolution
+            logger.info(
+                "No model found in config directory, using standard model path resolution"
+            )
+            model_path = None
+            model_dir = None
+    else:
+        model_path = None
+        model_dir = None
+
+    # If a specific model_path was provided, use it directly
     if args.model_path and os.path.exists(args.model_path):
         model_path = args.model_path
         model_dir = Path(model_path).parent
-    else:
+    elif not model_path:  # Only search if we didn't already find a model from config
         # Otherwise, find the latest model checkpoint directory
         checkpoint_dir = Path(args.checkpoint_dir)
         model_dirs = sorted(
@@ -428,11 +523,44 @@ def process_video(args):
         logger.error(f"Video not found: {video_path}")
         sys.exit(1)
 
-    # If model_path is provided, use it directly
+    # Check if we're using a training config file as input
+    if args.config_path and "training_config.yaml" in args.config_path:
+        # The checkpoint dir might be the parent directory of the config file
+        config_path = Path(args.config_path)
+        config_dir = config_path.parent
+
+        # Check if this is a training directory with checkpoint files
+        best_model_path = config_dir / "best_state.pth"
+        last_model_path = config_dir / "last_state.pth"
+
+        if os.path.exists(best_model_path):
+            model_path = best_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        elif os.path.exists(last_model_path):
+            model_path = last_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        else:
+            # Fall back to normal path resolution
+            logger.info(
+                "No model found in config directory, using standard model path resolution"
+            )
+            model_path = None
+            model_dir = None
+    else:
+        model_path = None
+        model_dir = None
+
+    # If a specific model_path was provided, use it directly
     if args.model_path and os.path.exists(args.model_path):
         model_path = args.model_path
         model_dir = Path(model_path).parent
-    else:
+    elif not model_path:  # Only search if we didn't already find a model from config
         # Otherwise, find the latest model checkpoint directory
         checkpoint_dir = Path(args.checkpoint_dir)
         model_dirs = sorted(
@@ -498,11 +626,44 @@ def process_video(args):
 
 def run_webcam(args):
     """Run prediction on webcam feed."""
-    # If model_path is provided, use it directly
+    # Check if we're using a training config file as input
+    if args.config_path and "training_config.yaml" in args.config_path:
+        # The checkpoint dir might be the parent directory of the config file
+        config_path = Path(args.config_path)
+        config_dir = config_path.parent
+
+        # Check if this is a training directory with checkpoint files
+        best_model_path = config_dir / "best_state.pth"
+        last_model_path = config_dir / "last_state.pth"
+
+        if os.path.exists(best_model_path):
+            model_path = best_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        elif os.path.exists(last_model_path):
+            model_path = last_model_path
+            model_dir = config_dir
+            logger.info(
+                f"Using model from config directory: {os.path.relpath(model_path)}"
+            )
+        else:
+            # Fall back to normal path resolution
+            logger.info(
+                "No model found in config directory, using standard model path resolution"
+            )
+            model_path = None
+            model_dir = None
+    else:
+        model_path = None
+        model_dir = None
+
+    # If a specific model_path was provided, use it directly
     if args.model_path and os.path.exists(args.model_path):
         model_path = args.model_path
         model_dir = Path(model_path).parent
-    else:
+    elif not model_path:  # Only search if we didn't already find a model from config
         # Otherwise, find the latest model checkpoint directory
         checkpoint_dir = Path(args.checkpoint_dir)
         model_dirs = sorted(
