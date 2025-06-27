@@ -1,0 +1,75 @@
+# Pipeline Configuration for Cat Analysis
+# This file contains all the model paths and configuration parameters for the unified cat analysis pipeline
+
+# Model Paths - Support both single models and multitask models
+models:
+    # Multitask model (single model for both tasks)
+    multitask_model: "src/checkpoints/multitask_regnet_y_3_2gf_20250627_034328/best_state.pth"
+
+    # Single models (separate models for each task)
+    breed_model: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/best_state.pth"
+    emotion_model: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/best_state.pth"
+
+    # YOLO detection model
+    yolo_model: "src/checkpoints/yolo/yolo12x.pt"
+
+# Class Names Files
+# Note: Paths depend on which model type is being used
+class_names:
+    # For multitask models
+    multitask:
+        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/class_names.json"
+        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/class_names.json"
+
+    # For single models
+    single:
+        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/class_names.json"
+        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/class_names.json"
+
+# Pipeline Settings
+pipeline:
+    device: "cuda" # cuda or cpu
+    img_size: 224
+    confidence_threshold: 0.05
+
+# Model Configurations
+model_config:
+    # Multitask model configuration
+    multitask:
+        backbone: "regnet_y_3_2gf"
+        pretrained: false
+        shared_features: false
+        mode: "multitask"
+
+    # Single model configurations
+    single:
+        breed:
+            backbone: "efficientnet_v2_s"
+            pretrained: false
+        emotion:
+            backbone: "regnet_y_3_2gf"
+            pretrained: false
+
+# YOLO Configuration
+yolo:
+    enabled: true
+    cat_class_id: 15 # COCO dataset cat class ID
+    confidence_threshold: 0.5
+
+# Data Paths
+data:
+    breed_data_root: "data/data-breed/processed"
+    emotion_data_root: "data/data-emo/processed"
+    output_dir: "data/json_datasets_with_emotions"
+
+# Visualization Settings
+visualization:
+    font_scale: 0.6
+    thickness: 2
+    padding: 8
+    bbox_color: [0, 255, 0] # Green
+    text_color_inside: [255, 255, 255] # White
+    text_color_outside: [0, 0, 0] # Black
+    background_color_inside: [0, 0, 0] # Black
+    background_color_outside: [0, 255, 0] # Green
+    transparency: 0.7

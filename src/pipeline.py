@@ -1,5 +1,5 @@
 """
-Pipeline for cat breed and emotion detection with animal tracking.
+Pipeline for cat breed and emotion detection with YOLO-based cat detection and flexible model support.
 
 UNIFIED PIPELINE FLOW (Applied to ALL input types):
 ======================================================
@@ -9,34 +9,34 @@ UNIFIED PIPELINE FLOW (Applied to ALL input types):
    - Video: Frame-by-frame processing
    - Webcam: Real-time frame processing
 
-2. ANIMAL DETECTION/TRACKING
-   - MMPose (if available): Advanced animal detection with pose estimation
+2. CAT DETECTION/TRACKING
+   - YOLO (if available): Fast and accurate cat detection using YOLOv8
    - Fallback: Whole image assumed to contain cat
 
 3. BOUNDING BOX EXTRACTION
-   - Extract detected animal bounding boxes
-   - Filter for cats/animals above confidence threshold
+   - Extract detected cat bounding boxes from YOLO results
+   - Filter for cats above confidence threshold
    - Validate bbox coordinates within image bounds
 
 4. FRAME CROPPING
    - Crop image regions based on detected bboxes
-   - Each detected animal gets its own cropped frame
+   - Each detected cat gets its own cropped frame
 
-5. BREED CLASSIFICATION
-   - Run breed classification model on each cropped frame
-   - Output: breed label + confidence score
+5. CLASSIFICATION (Two modes supported):
+   A. MULTITASK MODE (--multitask flag):
+      - Single model produces both breed and emotion predictions
+      - Single forward pass for both tasks
+   B. SINGLE MODEL MODE (default):
+      - Separate models for breed and emotion classification
+      - Two forward passes (one per task)
 
-6. EMOTION CLASSIFICATION
-   - Run emotion classification model on each cropped frame
-   - Output: emotion label + confidence score
-
-7. RESULT VISUALIZATION
-   - Draw bounding boxes around detected animals
+6. RESULT VISUALIZATION
+   - Draw bounding boxes around detected cats
    - Add refined labels (inside/above/below bbox as appropriate)
    - Semi-transparent backgrounds for optimal readability
 
-This ensures consistent processing regardless of input type.
-All images/frames follow the same 7-step pipeline flow.
+This ensures consistent processing regardless of input type and model configuration.
+All images/frames follow the same 6-step pipeline flow with flexible model support.
 """
 
 import argparse
@@ -54,6 +54,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+import yaml
 from PIL import Image
 
 # Import local modules
@@ -63,149 +64,202 @@ from model import load_model
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# MMPose imports (following the official demo pattern)
+# YOLO imports from ultralytics
 try:
-    from mmdet.apis import inference_detector, init_detector
+    from ultralytics import YOLO
 
-    MMDET_AVAILABLE = True
+    YOLO_AVAILABLE = True
+    logger.info("YOLO from ultralytics is available")
 except ImportError:
-    logger.warning("MMDet not available")
-    MMDET_AVAILABLE = False
+    logger.warning("YOLO from ultralytics not available. Install with: pip install ultralytics")
+    YOLO_AVAILABLE = False
 
-try:
-    from mmpose.apis import inference_topdown
-    from mmpose.apis import init_model as init_pose_estimator
-    from mmpose.evaluation.functional import nms
-    from mmpose.utils import adapt_mmdet_pipeline
 
-    MMPOSE_AVAILABLE = True
-except ImportError:
-    logger.warning("MMPose not available.")
-    MMPOSE_AVAILABLE = False
+def load_pipeline_config(config_path: str = "src/configs/pipeline.yaml") -> Dict:
+    """Load pipeline configuration from YAML file."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Pipeline configuration loaded from {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Configuration file not found: {config_path}")
+        raise
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML configuration: {e}")
+        raise
+
+
+def load_class_names_from_config(
+    config: Dict, class_type: str, use_multitask: bool = True
+) -> List[str]:
+    """Load class names from JSON file specified in config."""
+    model_type = "multitask" if use_multitask else "single"
+    class_names_path = config["class_names"][model_type][f"{class_type}_classes"]
+
+    if os.path.exists(class_names_path):
+        with open(class_names_path, "r") as f:
+            return json.load(f)
+    else:
+        logger.warning(f"Class names file not found: {class_names_path}")
+        return []
 
 
 class CatAnalysisPipeline:
     """
-    Pipeline for detecting, tracking and analyzing cats in images/videos.
+    Pipeline for detecting, tracking and analyzing cats in images/videos with flexible model support.
 
     Pipeline Flow:
     1. Input Processing (Image/Video/Webcam)
-    2. Animal Detection/Tracking (MMPose or fallback to full image)
-    3. Bounding Box Extraction (from detection results)
+    2. Cat Detection/Tracking (YOLO or fallback to full image)
+    3. Bounding Box Extraction (from YOLO detection results)
     4. Frame Cropping (based on detected bboxes)
-    5. Breed Classification (on cropped cat frames)
-    6. Emotion Classification (on cropped cat frames)
-    7. Result Visualization (with refined label positioning)
+    5. Classification (Multitask model OR separate breed/emotion models)
+    6. Result Visualization (with refined label positioning)
 
-    This ensures consistent processing across all input types.
+    This ensures consistent processing across all input types with flexible model configuration.
+    Supports both multitask models (single model for both tasks) and separate models.
     """
 
     def __init__(
         self,
-        breed_model_path: str,
-        emotion_model_path: str,
-        breed_classes: List[str],
-        emotion_classes: List[str],
-        device: str = "cuda",
-        img_size: int = 224,
-        confidence_threshold: float = 0.5,
+        config: Dict,
+        breed_classes: Optional[List[str]] = None,
+        emotion_classes: Optional[List[str]] = None,
+        use_multitask: bool = True,
     ):
         """
-        Initialize the pipeline.
+        Initialize the pipeline from configuration.
 
         Args:
-            breed_model_path: Path to trained breed classification model
-            emotion_model_path: Path to trained emotion classification model
-            breed_classes: List of breed class names
-            emotion_classes: List of emotion class names
-            device: Device to use for inference
-            img_size: Input image size for models
-            confidence_threshold: Minimum confidence for detections
+            config: Pipeline configuration dictionary loaded from YAML
+            breed_classes: List of breed class names (loaded from config if None)
+            emotion_classes: List of emotion class names (loaded from config if None)
+            use_multitask: Whether to use multitask model or separate models
         """
-        self.device = device
-        self.img_size = img_size
-        self.confidence_threshold = confidence_threshold
+        # Load configuration parameters
+        pipeline_config = config["pipeline"]
 
-        # Load breed classification model
-        logger.info(f"Loading breed model from {breed_model_path}")
-        self.breed_model = load_model(
-            path=breed_model_path,
-            num_classes=len(breed_classes),
-            model_type="breed",
-            model_config={"backbone": "mobilenet_v2", "pretrained": False},
-        )
-        self.breed_model.eval()
-        self.breed_model.to(device)
+        self.device = pipeline_config["device"]
+        self.img_size = pipeline_config["img_size"]
+        self.confidence_threshold = pipeline_config["confidence_threshold"]
+        self.use_multitask = use_multitask
+
+        # Load class names from config if not provided
+        if breed_classes is None:
+            breed_classes = load_class_names_from_config(config, "breed", use_multitask)
+        if emotion_classes is None:
+            emotion_classes = load_class_names_from_config(config, "emotion", use_multitask)
+
         self.breed_classes = breed_classes
-
-        # Load emotion classification model
-        logger.info(f"Loading emotion model from {emotion_model_path}")
-        self.emotion_model = load_model(
-            path=emotion_model_path,
-            num_classes=len(emotion_classes),
-            model_type="emotion",
-            model_config={"backbone": "mobilenet_v2", "pretrained": False},
-        )
-        self.emotion_model.eval()
-        self.emotion_model.to(device)
         self.emotion_classes = emotion_classes
+
+        # Load models based on mode
+        if use_multitask:
+            self._load_multitask_model(config)
+        else:
+            self._load_single_models(config)
+
+        # Store YOLO model path from config
+        self.yolo_model_path = config["models"]["yolo_model"]
+        self.yolo_config = config["yolo"]
 
         # Image preprocessing
         self.transform = transforms.Compose(
             [
-                transforms.Resize((img_size, img_size)),
+                transforms.Resize((self.img_size, self.img_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
 
-        # Initialize animal detection model if both MMDet and MMPose are available
-        if MMPOSE_AVAILABLE and MMDET_AVAILABLE:
-            self._init_detection_models()
+        # Initialize YOLO detection model if available and enabled
+        if YOLO_AVAILABLE and self.yolo_config["enabled"]:
+            self._init_yolo_model()
         else:
-            self.detector = None
-            self.pose_estimator = None
+            self.yolo_model = None
 
-    def _init_detection_models(self):
-        """Initialize MMDet and MMPose detection models following official demo pattern."""
+    def _load_multitask_model(self, config: Dict):
+        """Load multitask model for joint breed and emotion classification."""
+        model_config = config["model_config"]["multitask"]
+        multitask_model_path = config["models"]["multitask_model"]
+
+        logger.info(f"Loading multitask model from {multitask_model_path}")
+        logger.info(f"Model config: {model_config}")
+
+        self.model = load_model(
+            path=multitask_model_path,
+            num_classes=len(self.breed_classes),
+            model_type="multitask",
+            model_config=model_config,
+            num_emotion_classes=len(self.emotion_classes),
+        )
+        self.model.eval()
+        self.model.to(self.device)
+
+        # For multitask, we don't need separate models
+        self.breed_model = None
+        self.emotion_model = None
+
+    def _load_single_models(self, config: Dict):
+        """Load separate breed and emotion models."""
+        breed_model_config = config["model_config"]["single"]["breed"]
+        emotion_model_config = config["model_config"]["single"]["emotion"]
+
+        # Load breed classification model
+        breed_model_path = config["models"]["breed_model"]
+        logger.info(f"Loading breed model from {breed_model_path}")
+        logger.info(f"Breed model config: {breed_model_config}")
+
+        self.breed_model = load_model(
+            path=breed_model_path,
+            num_classes=len(self.breed_classes),
+            model_type="breed",
+            model_config=breed_model_config,
+        )
+        self.breed_model.eval()
+        self.breed_model.to(self.device)
+
+        # Load emotion classification model
+        emotion_model_path = config["models"]["emotion_model"]
+        logger.info(f"Loading emotion model from {emotion_model_path}")
+        logger.info(f"Emotion model config: {emotion_model_config}")
+
+        self.emotion_model = load_model(
+            path=emotion_model_path,
+            num_classes=len(self.emotion_classes),
+            model_type="emotion",
+            model_config=emotion_model_config,
+        )
+        self.emotion_model.eval()
+        self.emotion_model.to(self.device)
+
+        # For single models, we don't have a combined model
+        self.model = None
+
+    def _init_yolo_model(self):
+        """Initialize YOLO model for cat detection."""
         try:
-            if not (MMDET_AVAILABLE and MMPOSE_AVAILABLE):
-                logger.warning("Both MMDet and MMPose are required for animal detection")
-                self.detector = None
-                self.pose_estimator = None
+            if not YOLO_AVAILABLE:
+                logger.warning("YOLO not available")
+                self.yolo_model = None
                 return
 
-            # Use COCO-trained detector for animal detection (class 15 = cat)
-            det_config = "src/dependencies/mmpose/demo/mmdetection_cfg/rtmdet_m_8xb32-300e_coco.py"
-            det_checkpoint = "https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_m_8xb32-300e_coco/rtmdet_m_8xb32-300e_coco_20220719_112220-229f527c.pth"
+            # Initialize YOLO model from config path
+            logger.info(f"Loading YOLO model from {self.yolo_model_path}")
+            self.yolo_model = YOLO(self.yolo_model_path)
 
-            # Use animal pose estimator
-            pose_config = "src/dependencies/mmpose/configs/animal_2d_keypoint/topdown_heatmap/animalpose/td-hm_hrnet-w32_8xb64-210e_animalpose-256x256.py"
-            pose_checkpoint = "https://download.openmmlab.com/mmpose/animal/hrnet/hrnet_w32_animalpose_256x256-1aa7f075_20210426.pth"
+            # COCO dataset class IDs for cats (from config)
+            self.cat_class_id = self.yolo_config["cat_class_id"]
 
-            # Initialize detector following the official demo pattern
-            self.detector = init_detector(det_config, det_checkpoint, device=self.device)
-            self.detector.cfg = adapt_mmdet_pipeline(self.detector.cfg)
-
-            # Initialize pose estimator
-            self.pose_estimator = init_pose_estimator(
-                pose_config, pose_checkpoint, device=self.device
-            )
-
-            # Animal detection parameters
-            self.det_cat_id = 15  # COCO cat class
-            self.bbox_thr = self.confidence_threshold
-            self.nms_thr = 0.3
-
-            logger.info("Animal detection and pose estimation models initialized")
+            logger.info("YOLO model initialized successfully")
         except Exception as e:
-            logger.warning(f"Failed to initialize detection models: {e}")
-            self.detector = None
-            self.pose_estimator = None
+            logger.warning(f"Failed to initialize YOLO model: {e}")
+            self.yolo_model = None
 
     def detect_animals(self, image: np.ndarray) -> List[Dict]:
         """
-        Step 2: Detect/Track animals in the image using MMPose or fallback.
+        Step 2: Detect/Track cats in the image using YOLO or fallback.
 
         This is the core detection step that runs for ALL input types:
         - For images: Single detection per image
@@ -219,54 +273,54 @@ class CatAnalysisPipeline:
             List of detection dictionaries with bounding boxes and scores
             Format: [{"bbox": [x1, y1, x2, y2], "score": float, "label": str}]
         """
-        if not MMDET_AVAILABLE or self.detector is None:
+        if not YOLO_AVAILABLE or self.yolo_model is None:
             # Fallback: assume the whole image contains a cat
             h, w = image.shape[:2]
             return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat"}]
 
         try:
-            # Run detection following the official MMPose demo pattern
-            det_result = inference_detector(self.detector, image)
-            pred_instance = det_result.pred_instances.cpu().numpy()
+            # Convert BGR to RGB for YOLO (YOLO expects RGB)
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            # Extract bboxes with scores
-            bboxes = np.concatenate((pred_instance.bboxes, pred_instance.scores[:, None]), axis=1)
+            # Run YOLO inference
+            results = self.yolo_model(rgb_image, verbose=False)
 
-            # Filter for cats (class 15 in COCO) above threshold
-            bboxes = bboxes[
-                np.logical_and(
-                    pred_instance.labels == self.det_cat_id, pred_instance.scores > self.bbox_thr
-                )
-            ]
-
-            # Apply NMS to remove overlapping detections
-            if len(bboxes) > 0:
-                bboxes = bboxes[nms(bboxes, self.nms_thr)]
-
-            # Convert to our format
             detections = []
-            for bbox in bboxes:
-                if len(bbox) >= 5:  # x1, y1, x2, y2, score
-                    detections.append(
-                        {"bbox": bbox[:4].tolist(), "score": float(bbox[4]), "label": "cat"}
-                    )
 
-            # If using pose estimation, run pose detection for additional context
-            if MMPOSE_AVAILABLE and self.pose_estimator is not None and len(detections) > 0:
-                try:
-                    pose_bboxes = np.array([det["bbox"] for det in detections])
-                    pose_results = inference_topdown(self.pose_estimator, image, pose_bboxes)
-                    # Store pose results for potential future use
-                    for i, detection in enumerate(detections):
-                        if i < len(pose_results):
-                            detection["pose_keypoints"] = pose_results[i]
-                except Exception as e:
-                    logger.debug(f"Pose estimation failed: {e}")
+            # Process YOLO results
+            for result in results:
+                # Get detection boxes, scores, and class IDs
+                boxes = result.boxes
+                if boxes is not None:
+                    # Filter for cats only (class ID 15 in COCO)
+                    for i, class_id in enumerate(boxes.cls):
+                        if int(class_id) == self.cat_class_id:
+                            confidence = float(boxes.conf[i])
+
+                            # Filter by YOLO confidence threshold from config
+                            if confidence >= self.yolo_config["confidence_threshold"]:
+                                # Get bounding box coordinates (xyxy format)
+                                bbox = boxes.xyxy[i].cpu().numpy()
+                                x1, y1, x2, y2 = bbox
+
+                                # Ensure coordinates are within image bounds
+                                h, w = image.shape[:2]
+                                x1 = max(0, min(int(x1), w - 1))
+                                y1 = max(0, min(int(y1), h - 1))
+                                x2 = max(x1 + 1, min(int(x2), w))
+                                y2 = max(y1 + 1, min(int(y2), h))
+
+                                detections.append(
+                                    {"bbox": [x1, y1, x2, y2], "score": confidence, "label": "cat"}
+                                )
+
+            # Sort by confidence (highest first)
+            detections.sort(key=lambda x: x["score"], reverse=True)
 
             return detections
 
         except Exception as e:
-            logger.warning(f"Animal detection failed: {e}")
+            logger.warning(f"YOLO detection failed: {e}")
             # Fallback: assume the whole image contains a cat
             h, w = image.shape[:2]
             return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat"}]
@@ -277,6 +331,7 @@ class CatAnalysisPipeline:
 
         This runs on EVERY detected bounding box from the detection step.
         The same classification logic applies to all input types.
+        Supports both multitask and single model modes.
 
         Args:
             image_crop: Cropped cat image as numpy array (from detected bbox)
@@ -289,16 +344,22 @@ class CatAnalysisPipeline:
         input_tensor = self.transform(pil_image).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            # Breed classification
-            breed_outputs = self.breed_model(input_tensor)
-            breed_probs = F.softmax(breed_outputs, dim=1)
+            if self.use_multitask:
+                # Use multitask model for both predictions
+                breed_logits, emotion_logits = self.model(input_tensor, task="both")
+            else:
+                # Use separate models for breed and emotion
+                breed_logits = self.breed_model(input_tensor)
+                emotion_logits = self.emotion_model(input_tensor)
+
+            # Process breed predictions
+            breed_probs = F.softmax(breed_logits, dim=1)
             breed_confidence, breed_idx = torch.max(breed_probs, 1)
             breed_label = self.breed_classes[breed_idx.item()]
             breed_conf = breed_confidence.item()
 
-            # Emotion classification
-            emotion_outputs = self.emotion_model(input_tensor)
-            emotion_probs = F.softmax(emotion_outputs, dim=1)
+            # Process emotion predictions
+            emotion_probs = F.softmax(emotion_logits, dim=1)
             emotion_confidence, emotion_idx = torch.max(emotion_probs, 1)
             emotion_label = self.emotion_classes[emotion_idx.item()]
             emotion_conf = emotion_confidence.item()
@@ -314,9 +375,8 @@ class CatAnalysisPipeline:
         2. Detection: Animal detection/tracking
         3. Bbox Extraction: Get bounding boxes from detections
         4. Cropping: Extract cat regions based on bboxes
-        5. Breed Classification: Classify breed for each detected cat
-        6. Emotion Classification: Classify emotion for each detected cat
-        7. Visualization: Draw results with refined label positioning
+        5. Classification: Breed and emotion classification (multitask OR single models)
+        6. Visualization: Draw results with refined label positioning
 
         Used by: image processing, video frame processing, webcam frame processing
 
@@ -348,7 +408,7 @@ class CatAnalysisPipeline:
             crop = image[y1:y2, x1:x2]
 
             if crop.size > 0:
-                # Steps 5-6: Classify breed and emotion on cropped frame
+                # Step 5: Classification on cropped frame (breed and emotion)
                 breed_label, breed_conf, emotion_label, emotion_conf = (
                     self.classify_breed_and_emotion(crop)
                 )
@@ -364,7 +424,7 @@ class CatAnalysisPipeline:
                 }
                 results.append(result)
 
-                # Step 7: Visualization - Draw bounding box and refined labels
+                # Step 6: Visualization - Draw bounding box and refined labels
                 cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
                 # Create label text
@@ -493,7 +553,7 @@ class CatAnalysisPipeline:
 
         Pipeline Flow (applied to each frame):
         1. Input: Video frame
-        2-7. Same as process_image() for each frame
+        2-6. Same as process_image() for each frame
 
         Args:
             video_path: Path to input video
@@ -532,7 +592,7 @@ class CatAnalysisPipeline:
                 if not ret:
                     break
 
-                # Process frame using the same 7-step pipeline flow as single images
+                # Process frame using the same 6-step pipeline flow as single images
                 annotated_frame, results = self.process_image(frame)
 
                 # Write frame if output is specified
@@ -570,7 +630,7 @@ class CatAnalysisPipeline:
 
         Pipeline Flow (applied to each frame):
         1. Input: Webcam frame
-        2-7. Same as process_image() for each frame in real-time
+        2-6. Same as process_image() for each frame in real-time
 
         Args:
             camera_id: Camera device ID
@@ -589,7 +649,7 @@ class CatAnalysisPipeline:
                 if not ret:
                     break
 
-                # Process frame using the same 7-step pipeline flow (real-time)
+                # Process frame using the same 6-step pipeline flow (real-time)
                 annotated_frame, results = self.process_image(frame)
 
                 # Display frame
@@ -603,22 +663,16 @@ class CatAnalysisPipeline:
             cv2.destroyAllWindows()
 
 
-def load_class_names(class_names_path: str) -> List[str]:
-    """Load class names from JSON file."""
-    if os.path.exists(class_names_path):
-        with open(class_names_path, "r") as f:
-            return json.load(f)
-    else:
-        logger.warning(f"Class names file not found: {class_names_path}")
-        return []
-
-
 def main():
     """
     Main function for running the unified cat analysis pipeline.
 
-    ALL commands (image, video, webcam) use the same 7-step pipeline flow:
-    Detection → Bbox Extraction → Cropping → Breed Classification → Emotion Classification → Visualization
+    ALL commands (image, video, webcam) use the same 6-step pipeline flow:
+    YOLO Detection → Bbox Extraction → Cropping → Classification → Visualization
+
+    Classification can be done in two modes:
+    - Multitask mode (--multitask): Single model for both breed and emotion
+    - Single model mode (default): Separate models for breed and emotion
 
     The only difference between commands is the input source:
     - image: Single image file processing
@@ -629,46 +683,65 @@ def main():
 
     # Required arguments
     parser.add_argument("command", choices=["image", "video", "webcam"], help="Processing mode")
-    parser.add_argument("--breed-model", required=True, help="Path to breed classification model")
-    parser.add_argument(
-        "--emotion-model", required=True, help="Path to emotion classification model"
-    )
-    parser.add_argument("--breed-classes", required=True, help="Path to breed class names JSON")
-    parser.add_argument(
-        "--emotion-classes", required=True, help="Path to emotion class names JSON"
-    )
 
     # Optional arguments
+    parser.add_argument(
+        "--config",
+        default="src/configs/pipeline.yaml",
+        help="Path to pipeline configuration YAML file",
+    )
     parser.add_argument("--input", help="Input image/video path (required for image/video modes)")
     parser.add_argument("--output", help="Output path for processed video")
     parser.add_argument("--camera-id", type=int, default=0, help="Camera ID for webcam mode")
+
+    # Override arguments (optional - will override config file values)
+    parser.add_argument("--device", help="Device to use (overrides config)")
+    parser.add_argument("--img-size", type=int, help="Input image size (overrides config)")
     parser.add_argument(
-        "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use"
+        "--confidence", type=float, help="Detection confidence threshold (overrides config)"
     )
-    parser.add_argument("--img-size", type=int, default=224, help="Input image size")
     parser.add_argument(
-        "--confidence", type=float, default=0.5, help="Detection confidence threshold"
+        "--multitask",
+        action="store_true",
+        help="Use multitask model instead of separate breed and emotion models",
     )
 
     args = parser.parse_args()
 
-    # Load class names
-    breed_classes = load_class_names(args.breed_classes)
-    emotion_classes = load_class_names(args.emotion_classes)
-
-    if not breed_classes or not emotion_classes:
-        logger.error("Failed to load class names")
+    # Load pipeline configuration
+    try:
+        config = load_pipeline_config(args.config)
+    except Exception as e:
+        logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
-    # Initialize pipeline
+    # Override config values with command line arguments if provided
+    if args.device:
+        config["pipeline"]["device"] = args.device
+    if args.img_size:
+        config["pipeline"]["img_size"] = args.img_size
+    if args.confidence:
+        config["pipeline"]["confidence_threshold"] = args.confidence
+
+    # Load class names from config using multitask flag
+    breed_classes = load_class_names_from_config(config, "breed", args.multitask)
+    emotion_classes = load_class_names_from_config(config, "emotion", args.multitask)
+
+    if not breed_classes or not emotion_classes:
+        logger.error("Failed to load class names from configuration")
+        sys.exit(1)
+
+    logger.info(
+        f"Loaded {len(breed_classes)} breed classes and {len(emotion_classes)} emotion classes"
+    )
+    logger.info(f"Using {'multitask' if args.multitask else 'single'} model mode")
+
+    # Initialize pipeline with configuration
     pipeline = CatAnalysisPipeline(
-        breed_model_path=args.breed_model,
-        emotion_model_path=args.emotion_model,
+        config=config,
         breed_classes=breed_classes,
         emotion_classes=emotion_classes,
-        device=args.device,
-        img_size=args.img_size,
-        confidence_threshold=args.confidence,
+        use_multitask=args.multitask,
     )
 
     # Run processing based on command
@@ -690,7 +763,9 @@ def main():
             cv2.imwrite(args.output, annotated_image)
             logger.info(f"Result saved to {args.output}")
         else:
-            cv2.imshow("Cat Analysis Result", annotated_image)
+            w, h = annotated_image.shape[1], annotated_image.shape[0]
+
+            cv2.imshow("Cat Analysis Result", cv2.resize(annotated_image, (w // 2, h // 2)))
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 

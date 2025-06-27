@@ -77,7 +77,6 @@ project/
 
 -   The pre-trained backbone is enhanced with:
     -   Custom fully connected layers
-    -   Dropout for regularization (configurable rate)
     -   Final softmax layer for breed probability distribution
 
 ### Configuration
@@ -86,7 +85,6 @@ project/
 -   Parameters include:
     -   Backbone model choice
     -   Number of classes (21 cat breeds)
-    -   Dropout rate (default: 0.5)
     -   Whether to use pre-trained weights
 
 ## 3. Training Pipeline
@@ -209,7 +207,6 @@ backbone: CatBreedClassifier
 batch_size: 64
 checkpoint_dir: path/to/checkpoints
 device: cuda
-dropout_rate: 0.5
 early_stopping: 10
 epochs: 3
 learning_rate: 0.001

@@ -26,7 +26,6 @@ In the example above, the learning rate and number of epochs from the command li
 | ------------ | ---------------------------------- | ----------- |
 | backbone     | Model architecture to use          | mobilenetv2 |
 | pretrained   | Whether to use pre-trained weights | true        |
-| dropout_rate | Dropout rate for regularization    | 0.5         |
 
 ### Optimization Parameters
 
@@ -52,7 +51,6 @@ In the example above, the learning rate and number of epochs from the command li
 # Model parameters
 backbone: mobilenetv2
 pretrained: true
-dropout_rate: 0.5
 
 # Optimization parameters
 learning_rate: 0.001

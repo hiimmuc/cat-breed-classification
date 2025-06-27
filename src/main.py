@@ -6,16 +6,26 @@ import logging
 import os
 import sys
 from pathlib import Path
-from test import CatBreedPredictor
+from typing import Dict, List, Optional
 
 import torch
 import torch.optim as optim
 import yaml
 
+HOME = Path(__file__).resolve().parent
+
+# Import local modules
+sys.path.insert(0, str(HOME))
+import test
+from test import CatBreedPredictor
+
 from evaluate import Evaluator
 from model import create_model, load_model
 from trainer import CatModelTrainer
-from utils.data_utils import get_data_loaders
+from utils.data_utils import (
+    get_multitask_data_loaders_from_json,
+    get_single_task_data_loaders_from_json,
+)
 from utils.visualization import setup_logger
 
 # Set up paths
@@ -30,93 +40,56 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Cat Breed Classification")
+    parser = argparse.ArgumentParser(description="Cat Classification Pipeline")
 
-    # Main command
+    parser.add_argument("command", choices=["train", "evaluate", "predict", "video", "webcam"])
+    parser.add_argument("--config-path", type=str, help="YAML config file path")
+
+    # Core arguments
+    parser.add_argument("--data-root", type=str, default=str(DATA_DIR))
+    parser.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
+    parser.add_argument("--model-path", type=str, help="Model checkpoint path")
     parser.add_argument(
-        "command",
-        choices=["train", "test", "evaluate", "predict", "video", "webcam"],
-        help="Command to execute",
-    )  # Common arguments
-    parser.add_argument(
-        "--config-path",
-        type=str,
-        help="Path to a YAML configuration file (e.g., training_config.yaml). Command line arguments will override these settings.",
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument(
-        "--data-dir", type=str, default=str(DATA_DIR), help="Path to data directory"
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default=str(CHECKPOINT_DIR),
-        help="Directory to save/load checkpoints",
-    )
-    parser.add_argument("--model-path", type=str, help="Path to model checkpoint")
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="mobilenetv2",
-        help="Model backbone architecture",
-    )
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument(
-        "--num-workers", type=int, default=4, help="Number of data loading workers"
-    )
-    parser.add_argument("--img-size", type=int, default=224, help="Input image size")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use (cuda or cpu)",
-    )
-    parser.add_argument("--log-file", type=str, help="Log file path")  # Training arguments
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay")
-    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["breed", "emotion"],
-        default="breed",
-        help="Training mode: breed classification or emotion recognition",
-    )
-    parser.add_argument(
-        "--use-tensorboard",
-        action="store_true",
-        default=True,
-        help="Enable TensorBoard logging for training visualization",
+        "--mode", type=str, choices=["breed", "emotion", "multitask"], default="breed"
     )
 
-    # Testing/evaluation arguments
-    parser.add_argument("--output-dir", type=str, help="Output directory for evaluation results")
+    # Model config
+    parser.add_argument("--backbone", type=str, default="mobilenet_v2")
+    parser.add_argument("--img-size", type=int, default=224)
 
-    # Prediction arguments
-    parser.add_argument("--input", type=str, help="Input image or video path")
-    parser.add_argument("--output", type=str, help="Output path for processed video")
-    parser.add_argument("--camera-id", type=int, default=0, help="Camera ID for webcam")
+    # Dataset paths (can be provided via config file)
+    parser.add_argument("--train-json", type=str, help="Path to training JSON dataset file")
+    parser.add_argument("--val-json", type=str, help="Path to validation JSON dataset file")
+    parser.add_argument("--test-json", type=str, help="Path to test JSON dataset file")
+
+    # Training params
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=4)
+
+    # Multitask weights
+    parser.add_argument("--breed-weight", type=float, default=1.0)
+    parser.add_argument("--emotion-weight", type=float, default=1.0)
+    parser.add_argument("--shared-features", action="store_true", default=False)
+
+    # I/O
+    parser.add_argument("--input", type=str, help="Input image/video path")
+    parser.add_argument("--output", type=str, help="Output path")
+    parser.add_argument("--output-dir", type=str, help="Output directory")
+    parser.add_argument("--camera-id", type=int, default=0)
+    parser.add_argument("--log-file", type=str, help="Log file path")
 
     return parser.parse_args()
 
 
-def load_and_update_config(args):
-    """
-    Load configuration from YAML file if specified and update args.
-    Config file values overwrite default values.
-    Command-line arguments take precedence over config values.
-
-    Args:
-        args: Command-line arguments
-
-    Returns:
-        Updated args with precedence: CLI args > config values > defaults
-    """
-    # Store which CLI args were explicitly provided
-    cli_parser = argparse.ArgumentParser()
-    cli_args, _ = cli_parser.parse_known_args()
-    explicitly_provided = {key: True for key, val in vars(cli_args).items() if val is not None}
-
+def load_and_update_config(args) -> argparse.Namespace:
+    """Load configuration from YAML file and update args with CLI precedence."""
     if not args.config_path:
         return args
 
@@ -127,131 +100,126 @@ def load_and_update_config(args):
 
     try:
         logger.info(f"Loading configuration from {config_path}")
-        with open(config_path, "r") as f:
+        with config_path.open("r") as f:
             config = yaml.safe_load(f)
 
         if not config:
             logger.warning(f"Empty or invalid configuration file: {config_path}")
             return args
 
-        # Create a dictionary from args for easier manipulation
-        args_dict = vars(args)
-
-        # Create a parser with default values to check against
-        default_parser = argparse.ArgumentParser()
-        default_parser.add_argument(
-            "command",
-            choices=["train", "test", "evaluate", "predict", "video", "webcam"],
-        )
-        default_parser.add_argument("--config-path", type=str)
-        default_parser.add_argument("--data-dir", type=str, default=str(DATA_DIR))
-        default_parser.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
-        default_parser.add_argument("--model-path", type=str)
-        default_parser.add_argument("--backbone", type=str, default="mobilenetv2")
-        default_parser.add_argument("--batch-size", type=int, default=32)
-        default_parser.add_argument("--num-workers", type=int, default=4)
-        default_parser.add_argument("--img-size", type=int, default=224)
-        default_parser.add_argument(
-            "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
-        )
-        default_parser.add_argument("--log-file", type=str)
-        default_parser.add_argument("--epochs", type=int, default=30)
-        default_parser.add_argument("--lr", type=float, default=0.001)
-        default_parser.add_argument("--weight-decay", type=float, default=1e-4)
-        default_parser.add_argument("--patience", type=int, default=10)
-        default_parser.add_argument("--mode", type=str, default="breed")
-        default_parser.add_argument("--output-dir", type=str)
-        default_parser.add_argument("--input", type=str)
-        default_parser.add_argument("--output", type=str)
-        default_parser.add_argument("--camera-id", type=int, default=0)
-
-        default_args = default_parser.parse_args([args.command])
-        default_arg_values = vars(default_args)  # Handle special case for training_config.yaml
-        if "training_config.yaml" in str(config_path):
-            # For training configs, we should use the directory containing the config
-            # as the checkpoint_dir if we're in evaluation mode
-            if args.command == "evaluate" and "checkpoint_dir" in config:
-                # Parse the directory this config file is in
-                parent_dir = config_path.parent
+        # Handle special case for training_config.yaml during evaluation
+        if "training_config.yaml" in str(config_path) and args.command == "evaluate":
+            if not args.checkpoint_dir or args.checkpoint_dir == str(CHECKPOINT_DIR):
+                args.checkpoint_dir = str(config_path.parent)
                 logger.info(
-                    f"Evaluation using training config: Setting checkpoint directory to {parent_dir}"
+                    f"Using training config directory as checkpoint_dir: {config_path.parent}"
                 )
-                args_dict["checkpoint_dir"] = str(parent_dir)
 
-        # Map config keys to argument names
-        config_to_arg_map = {
-            "backbone": "backbone",
-            "batch_size": "batch_size",
-            "learning_rate": "lr",
-            "weight_decay": "weight_decay",
-            "epochs": "epochs",
-            "early_stopping": "patience",
-            "device": "device",
-            "img_size": "img_size",
-            "num_workers": "num_workers",
-            "checkpoint_dir": "checkpoint_dir",
-            "data_dir": "data_dir",
-            "output_dir": "output_dir",
-            "model_path": "model_path",
-            "mode": "mode",
-            "dropout_rate": None,  # Ignore - not a CLI argument
-            "pretrained": None,  # Ignore - not a CLI argument
-            "num_classes": None,  # Ignore - not a CLI argument
-            "optimizer": None,  # Ignore - not a CLI argument
-            "scheduler": None,  # Ignore - not a CLI argument
-            "use_tensorboard": "use_tensorboard",  # Map TensorBoard option
+        # Configuration mapping with type conversion info
+        config_mapping = {
+            # Basic config -> (arg_name, default_value, type_converter)
+            "backbone": ("backbone", "mobilenet_v2", str),
+            "batch_size": ("batch_size", 32, int),
+            "learning_rate": ("lr", 3e-4, float),
+            "weight_decay": ("weight_decay", 1e-4, float),
+            "epochs": ("epochs", 50, int),
+            "early_stopping": ("patience", 10, int),
+            "device": ("device", "cuda" if torch.cuda.is_available() else "cpu", str),
+            "img_size": ("img_size", 224, int),
+            "num_workers": ("num_workers", 4, int),
+            "checkpoint_dir": ("checkpoint_dir", str(CHECKPOINT_DIR), str),
+            "data_root": ("data_root", str(DATA_DIR), str),
+            "output_dir": ("output_dir", None, str),
+            "model_path": ("model_path", None, str),
+            "mode": ("mode", "breed", str),
+            "breed_weight": ("breed_weight", 1.0, float),
+            "emotion_weight": ("emotion_weight", 1.0, float),
+            "shared_features": ("shared_features", True, bool),
+            "train_json": ("train_json", None, str),
+            "val_json": ("val_json", None, str),
+            "test_json": ("test_json", None, str),
         }
 
-        # Apply config values over defaults, but only if not explicitly set in command line
-        for config_key, arg_name in config_to_arg_map.items():
-            if arg_name is None or arg_name not in args_dict:
-                continue
+        # Apply config values only if args use defaults (CLI takes precedence)
+        for config_key, (arg_name, default_value, type_converter) in config_mapping.items():
+            if hasattr(args, arg_name) and config_key in config:
+                current_value = getattr(args, arg_name)
+                if current_value == default_value:
+                    config_value = type_converter(config[config_key])
+                    setattr(args, arg_name, config_value)
+                    logger.debug(f"Applied config: {arg_name} = {config_value}")
+                elif current_value != default_value:
+                    logger.debug(f"Keeping CLI argument: {arg_name} = {current_value}")
 
-            # Apply config values if available and not explicitly set via CLI
-            if config_key in config and arg_name not in explicitly_provided:
-                logger.debug(f"Setting {arg_name} = {config[config_key]} from config file")
-                args_dict[arg_name] = config[config_key]  # Print the final configuration used
-
-        logger.info("Final configuration:")
-        for key, value in args_dict.items():
-            if key != "command" and key != "config_path":
-                logger.info(f"  {key}: {value}")
-
+        logger.info("Configuration loaded successfully")
         return args
+
     except Exception as e:
         logger.error(f"Error loading configuration: {e}")
         return args
 
 
-def train(args):
+def create_optimizer_and_scheduler(
+    model: torch.nn.Module, lr: float, weight_decay: float
+) -> tuple:
+    """Create optimizer and learning rate scheduler."""
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.2, patience=20, min_lr=1e-6
+    )
+    return optimizer, scheduler
+
+
+def create_model_config(args: argparse.Namespace, shared_features: bool = False) -> Dict[str, any]:
+    """Create model configuration dictionary."""
+    return {
+        "backbone": args.backbone,
+        "pretrained": True,
+        "shared_features": shared_features,
+    }
+
+
+def train(args: argparse.Namespace) -> None:
     """Train a model."""
     logger.info(f"Starting training with {args.backbone} backbone in {args.mode} mode")
 
-    # Load data
-    data_loaders = get_data_loaders(
-        data_dir=str(args.data_dir),
+    if args.mode == "multitask":
+        train_multitask(args)
+    else:
+        train_single_task(args)
+
+
+def train_single_task(args: argparse.Namespace) -> None:
+    """Train a single-task model using JSON datasets."""
+    logger.info(f"Loading {args.mode} data from JSON files")
+
+    # Load data and create model
+    data_loaders = get_single_task_data_loaders_from_json(
+        train_json_path=args.train_json,
+        val_json_path=args.val_json,
+        test_json_path=args.test_json,
+        data_root=args.data_root,
+        task=args.mode,
+        img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_size=args.img_size,
+        augment_data=True,
     )
 
-    train_loader = data_loaders["train"]
-    val_loader = data_loaders["val"]
-    class_names = data_loaders["class_names"]
+    train_loader, val_loader, class_names = (
+        data_loaders["train"],
+        data_loaders["val"],
+        data_loaders["class_names"],
+    )
 
-    # Create model
-    model_config = {"backbone": args.backbone, "pretrained": True, "dropout_rate": 0.1}
-
+    # Create model and training components
+    model_config = create_model_config(args)
     model = create_model(
         num_classes=len(class_names), model_config=model_config, model_type=args.mode
     )
+    optimizer, scheduler = create_optimizer_and_scheduler(model, args.lr, args.weight_decay)
 
-    # Create optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.2, patience=20, min_lr=1e-6
-    )  # Create trainer
+    # Create and run trainer
     trainer = CatModelTrainer(
         model=model,
         train_loader=train_loader,
@@ -260,459 +228,331 @@ def train(args):
         lr_scheduler=scheduler,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
-        use_tensorboard=args.use_tensorboard,
+        use_tensorboard=getattr(args, "use_tensorboard", True),
     )
 
-    # Train model
     history = trainer.fit(
         epochs=args.epochs, early_stopping_patience=args.patience, save_best_only=True
-    )  # No need to save class names and model separately as it's handled by the trainer
-    logger.info(f"Training completed, models saved to {trainer.checkpoint_dir}")
+    )
+    logger.info(f"Training completed, model saved to {trainer.checkpoint_dir}")
 
 
-def evaluate(args):
-    """Evaluate a model."""
-    # Check if we're using a training config file as input
-    if args.config_path and "training_config.yaml" in args.config_path:
-        # The checkpoint dir might be the parent directory of the config file
-        config_path = Path(args.config_path)
-        config_dir = config_path.parent
+def train_multitask(args: argparse.Namespace) -> None:
+    """Train a multitask model using JSON datasets."""
+    from multitask_trainer import CatMultitaskTrainer
 
-        # Check if this is a training directory with checkpoint files
-        best_model_path = config_dir / "best_state.pth"
-        last_model_path = config_dir / "last_state.pth"
+    logger.info("Loading multitask data from JSON files")
 
-        if os.path.exists(best_model_path):
-            model_path = best_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        elif os.path.exists(last_model_path):
-            model_path = last_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        else:
-            # Fall back to normal path resolution
-            logger.info("No model found in config directory, using standard model path resolution")
-            model_path = None
-            model_dir = None
-    else:
-        model_path = None
-        model_dir = None
-
-    # If a specific model_path was provided, use it directly
-    if args.model_path and os.path.exists(args.model_path):
-        model_path = args.model_path
-        model_dir = Path(model_path).parent
-    elif not model_path:  # Only search if we didn't already find a model from config
-        # Otherwise, find the latest model checkpoint directory
-        checkpoint_dir = Path(args.checkpoint_dir)
-        model_dirs = sorted(
-            [d for d in checkpoint_dir.glob("*_*") if d.is_dir()],
-            key=os.path.getmtime,
-            reverse=True,
-        )
-
-        if not model_dirs:
-            logger.error(
-                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
-            )
-            sys.exit(1)
-
-        # Use the latest directory
-        model_dir = model_dirs[0]
-        model_path = model_dir / "best_state.pth"
-
-        if not model_path.exists():
-            model_path = model_dir / "last_state.pth"
-
-        if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {os.path.relpath(model_dir)}")
-            sys.exit(1)
-
-    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
-
-    # Load class names
-    class_names_path = model_dir / "class_names.json"
-    if os.path.exists(class_names_path):
-        with open(class_names_path, "r") as f:
-            class_names = json.load(f)
-    else:
-        # If class names not found, try to determine from data directory
-        class_names = [
-            d.name
-            for d in Path(args.data_dir).iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
-        class_names.sort()
-
-    # Load data
-    data_loaders = get_data_loaders(
-        data_dir=args.data_dir,
+    # Load data and get class information
+    data_loaders = get_multitask_data_loaders_from_json(
+        train_json_path=args.train_json,
+        val_json_path=args.val_json,
+        test_json_path=args.test_json,
+        data_root=args.data_root,
+        img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_size=args.img_size,
+        augment_data=True,
     )
 
-    test_loader = data_loaders["test"]
-
-    # Load model
-    model = load_model(
-        path=model_path,
-        num_classes=len(class_names),
-        model_config={"backbone": args.backbone, "pretrained": False},
+    num_breed_classes, num_emotion_classes = (
+        data_loaders["num_breed_classes"],
+        data_loaders["num_emotion_classes"],
+    )
+    logger.info(
+        f"Multitask model: {num_breed_classes} breed classes, {num_emotion_classes} emotion classes"
     )
 
-    # Create evaluator
-    output_dir = args.output_dir or Path(args.checkpoint_dir) / "evaluation"
-    os.makedirs(output_dir, exist_ok=True)
+    # Create model and training components
+    model_config = create_model_config(args, shared_features=args.shared_features)
+    model = create_model(
+        num_classes=num_breed_classes,
+        num_emotion_classes=num_emotion_classes,
+        model_config=model_config,
+        model_type="multitask",
+    )
+    optimizer, scheduler = create_optimizer_and_scheduler(model, args.lr, args.weight_decay)
 
-    evaluator = Evaluator(
-        model=model, test_loader=test_loader, device=args.device, output_dir=output_dir
+    # Create and run trainer
+    trainer = CatMultitaskTrainer(
+        model=model,
+        train_loader=data_loaders["train"],
+        val_loader=data_loaders["val"],
+        optimizer=optimizer,
+        device=args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        breed_weight=args.breed_weight,
+        emotion_weight=args.emotion_weight,
+        loss_type="cross_entropy",
+        lr_scheduler=scheduler,
+        use_tensorboard=getattr(args, "use_tensorboard", True),
     )
 
-    # Evaluate model
-    results = evaluator.evaluate(class_names=class_names)
-
-    # Print key metrics
-    logger.info("Evaluation Summary:")
-    logger.info(f"Accuracy: {results['accuracy']:.4f}")
-    logger.info(f"F1 Score: {results['f1_score']:.4f}")
-    logger.info(f"Top-3 Accuracy: {results['top3_accuracy']:.4f}")
-    logger.info(f"Average Inference Time: {results['avg_inference_time_ms']:.2f} ms/sample")
+    history = trainer.fit(
+        epochs=args.epochs, early_stopping_patience=args.patience, save_best_only=True
+    )
+    logger.info(f"Multitask training completed, models saved to {trainer.checkpoint_dir}")
 
 
-def predict(args):
-    """Run prediction on a single image."""
-    if not args.input:
-        logger.error("Input image path is required")
-        sys.exit(1)
+def load_test_data(args: argparse.Namespace) -> Dict[str, any]:
+    """Load test data based on mode (single-task or multitask)."""
+    data_loader_kwargs = {
+        "train_json_path": args.train_json,
+        "val_json_path": args.val_json,
+        "test_json_path": args.test_json,
+        "data_root": args.data_root,
+        "img_size": args.img_size,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "augment_data": False,
+    }
 
-    image_path = args.input
-    if not os.path.exists(image_path):
-        logger.error(f"Image not found: {image_path}")
-        sys.exit(1)
-
-    # Check if we're using a training config file as input
-    if args.config_path and "training_config.yaml" in args.config_path:
-        # The checkpoint dir might be the parent directory of the config file
-        config_path = Path(args.config_path)
-        config_dir = config_path.parent
-
-        # Check if this is a training directory with checkpoint files
-        best_model_path = config_dir / "best_state.pth"
-        last_model_path = config_dir / "last_state.pth"
-
-        if os.path.exists(best_model_path):
-            model_path = best_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        elif os.path.exists(last_model_path):
-            model_path = last_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        else:
-            # Fall back to normal path resolution
-            logger.info("No model found in config directory, using standard model path resolution")
-            model_path = None
-            model_dir = None
+    if args.mode == "multitask":
+        return get_multitask_data_loaders_from_json(**data_loader_kwargs)
     else:
-        model_path = None
-        model_dir = None
+        return get_single_task_data_loaders_from_json(task=args.mode, **data_loader_kwargs)
 
-    # If a specific model_path was provided, use it directly
-    if args.model_path and os.path.exists(args.model_path):
-        model_path = args.model_path
-        model_dir = Path(model_path).parent
-    elif not model_path:  # Only search if we didn't already find a model from config
-        # Otherwise, find the latest model checkpoint directory
-        checkpoint_dir = Path(args.checkpoint_dir)
-        model_dirs = sorted(
-            [d for d in checkpoint_dir.glob("*_*") if d.is_dir()],
-            key=os.path.getmtime,
-            reverse=True,
+
+def load_evaluation_model(args: argparse.Namespace, model_path: str, data_loaders: Dict[str, any]):
+    """Load model for evaluation based on mode."""
+    model_config = {"backbone": args.backbone, "pretrained": False}
+
+    if args.mode == "multitask":
+        return load_model(
+            path=model_path,
+            num_classes=data_loaders["num_breed_classes"],
+            num_emotion_classes=data_loaders["num_emotion_classes"],
+            model_config=model_config,
+            model_type="multitask",
+        )
+    else:
+        return load_model(
+            path=model_path,
+            num_classes=len(data_loaders["class_names"]),
+            model_config=model_config,
         )
 
-        if not model_dirs:
-            logger.error(
-                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
-            )
-            sys.exit(1)
 
-        # Use the latest directory
-        model_dir = model_dirs[0]
-        model_path = model_dir / "best_state.pth"
+def evaluate(args: argparse.Namespace) -> None:
+    """Evaluate a model using JSON datasets."""
+    model_path, model_dir, class_names = get_model_path_and_classes(args)
 
-        if not model_path.exists():
-            model_path = model_dir / "last_state.pth"
+    # Load data and model
+    data_loaders = load_test_data(args)
+    model = load_evaluation_model(args, model_path, data_loaders)
 
-        if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {os.path.relpath(model_dir)}")
-            sys.exit(1)
+    # Set up evaluation
+    output_dir = args.output_dir or Path(args.checkpoint_dir) / "evaluation"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
 
-    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
+    evaluator = Evaluator(
+        model=model, test_loader=data_loaders["test"], device=args.device, output_dir=output_dir
+    )
+    results = evaluator.evaluate(class_names=class_names)
 
-    # Load class names
-    class_names_path = model_dir / "class_names.json"
-    if os.path.exists(class_names_path):
-        with open(class_names_path, "r") as f:
-            class_names = json.load(f)
-    else:
-        # If class names not found, try to determine from data directory
-        class_names = [
-            d.name
-            for d in Path(args.data_dir).iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
-        class_names.sort()
+    # Log key metrics
+    metrics = ["accuracy", "f1_score", "top3_accuracy"]
+    logger.info("Evaluation Summary:")
+    for metric in metrics:
+        if metric in results:
+            logger.info(f"{metric.replace('_', ' ').title()}: {results[metric]:.4f}")
 
-    # Create predictor
-    predictor = CatBreedPredictor(
+    if "avg_inference_time_ms" in results:
+        logger.info(f"Average Inference Time: {results['avg_inference_time_ms']:.2f} ms/sample")
+
+
+def validate_input_path(path: str, file_type: str) -> None:
+    """Validate that input path exists."""
+    if not path:
+        logger.error(f"Input {file_type} path is required")
+        sys.exit(1)
+    if not os.path.exists(path):
+        logger.error(f"{file_type.title()} not found: {path}")
+        sys.exit(1)
+
+
+def create_predictor(args: argparse.Namespace) -> CatBreedPredictor:
+    """Create a predictor instance with model and class names."""
+    model_path, model_dir, class_names = get_model_path_and_classes(args)
+    return CatBreedPredictor(
         model_path=model_path,
         class_names=class_names,
         device=args.device,
         img_size=args.img_size,
     )
 
-    # Make prediction
-    fig = predictor.predict_and_visualize(image_path)
 
-    # Save or show result
+def predict(args: argparse.Namespace) -> None:
+    """Run prediction on a single image."""
+    validate_input_path(args.input, "image")
+
+    predictor = create_predictor(args)
+    fig = predictor.predict_and_visualize(args.input)
+
     if args.output:
         fig.savefig(args.output)
-        logger.info(f"Prediction visualization saved to {os.path.relpath(args.output)}")
+        logger.info(f"Prediction visualization saved to {Path(args.output).resolve()}")
     else:
         import matplotlib.pyplot as plt
 
         plt.show()
 
 
-def process_video(args):
+def process_video(args: argparse.Namespace) -> None:
     """Process a video file."""
-    if not args.input:
-        logger.error("Input video path is required")
-        sys.exit(1)
+    validate_input_path(args.input, "video")
 
-    video_path = args.input
-    if not os.path.exists(video_path):
-        logger.error(f"Video not found: {video_path}")
-        sys.exit(1)
-
-    # Check if we're using a training config file as input
-    if args.config_path and "training_config.yaml" in args.config_path:
-        # The checkpoint dir might be the parent directory of the config file
-        config_path = Path(args.config_path)
-        config_dir = config_path.parent
-
-        # Check if this is a training directory with checkpoint files
-        best_model_path = config_dir / "best_state.pth"
-        last_model_path = config_dir / "last_state.pth"
-
-        if os.path.exists(best_model_path):
-            model_path = best_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        elif os.path.exists(last_model_path):
-            model_path = last_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        else:
-            # Fall back to normal path resolution
-            logger.info("No model found in config directory, using standard model path resolution")
-            model_path = None
-            model_dir = None
-    else:
-        model_path = None
-        model_dir = None
-
-    # If a specific model_path was provided, use it directly
-    if args.model_path and os.path.exists(args.model_path):
-        model_path = args.model_path
-        model_dir = Path(model_path).parent
-    elif not model_path:  # Only search if we didn't already find a model from config
-        # Otherwise, find the latest model checkpoint directory
-        checkpoint_dir = Path(args.checkpoint_dir)
-        model_dirs = sorted(
-            [d for d in checkpoint_dir.glob("*_*") if d.is_dir()],
-            key=os.path.getmtime,
-            reverse=True,
-        )
-
-        if not model_dirs:
-            logger.error(
-                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
-            )
-            sys.exit(1)
-
-        # Use the latest directory
-        model_dir = model_dirs[0]
-        model_path = model_dir / "best_state.pth"
-
-        if not model_path.exists():
-            model_path = model_dir / "last_state.pth"
-
-        if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {os.path.relpath(model_dir)}")
-            sys.exit(1)
-
-    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
-
-    # Load class names
-    class_names_path = model_dir / "class_names.json"
-    if os.path.exists(class_names_path):
-        with open(class_names_path, "r") as f:
-            class_names = json.load(f)
-    else:
-        # If class names not found, try to determine from data directory
-        class_names = [
-            d.name
-            for d in Path(args.data_dir).iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
-        class_names.sort()
-
-    # Create predictor
-    predictor = CatBreedPredictor(
-        model_path=model_path,
-        class_names=class_names,
-        device=args.device,
-        img_size=args.img_size,
-    )
-
-    # Process video
-    output_path = args.output
-    display = output_path is None
-
+    predictor = create_predictor(args)
     output = predictor.process_video(
-        video_path=video_path, output_path=output_path, display=display
+        video_path=args.input, output_path=args.output, display=args.output is None
     )
 
     if output:
-        logger.info(f"Processed video saved to {os.path.relpath(output)}")
+        logger.info(f"Processed video saved to {Path(output).resolve()}")
 
 
-def run_webcam(args):
+def run_webcam(args: argparse.Namespace) -> None:
     """Run prediction on webcam feed."""
-    # Check if we're using a training config file as input
-    if args.config_path and "training_config.yaml" in args.config_path:
-        # The checkpoint dir might be the parent directory of the config file
-        config_path = Path(args.config_path)
-        config_dir = config_path.parent
+    predictor = create_predictor(args)
 
-        # Check if this is a training directory with checkpoint files
-        best_model_path = config_dir / "best_state.pth"
-        last_model_path = config_dir / "last_state.pth"
-
-        if os.path.exists(best_model_path):
-            model_path = best_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        elif os.path.exists(last_model_path):
-            model_path = last_model_path
-            model_dir = config_dir
-            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
-        else:
-            # Fall back to normal path resolution
-            logger.info("No model found in config directory, using standard model path resolution")
-            model_path = None
-            model_dir = None
-    else:
-        model_path = None
-        model_dir = None
-
-    # If a specific model_path was provided, use it directly
-    if args.model_path and os.path.exists(args.model_path):
-        model_path = args.model_path
-        model_dir = Path(model_path).parent
-    elif not model_path:  # Only search if we didn't already find a model from config
-        # Otherwise, find the latest model checkpoint directory
-        checkpoint_dir = Path(args.checkpoint_dir)
-        model_dirs = sorted(
-            [d for d in checkpoint_dir.glob("*_*") if d.is_dir()],
-            key=os.path.getmtime,
-            reverse=True,
-        )
-
-        if not model_dirs:
-            logger.error(
-                f"No model checkpoint directories found in {os.path.relpath(checkpoint_dir)}"
-            )
-            sys.exit(1)
-
-        # Use the latest directory
-        model_dir = model_dirs[0]
-        model_path = model_dir / "best_state.pth"
-
-        if not model_path.exists():
-            model_path = model_dir / "last_state.pth"
-
-        if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {os.path.relpath(model_dir)}")
-            sys.exit(1)
-
-    logger.info(f"Using model checkpoint: {os.path.relpath(model_path)}")
-
-    # Load class names
-    class_names_path = model_dir / "class_names.json"
-    if os.path.exists(class_names_path):
-        with open(class_names_path, "r") as f:
-            class_names = json.load(f)
-    else:
-        # If class names not found, try to determine from data directory
-        class_names = [
-            d.name
-            for d in Path(args.data_dir).iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
-        class_names.sort()
-
-    # Create predictor
-    predictor = CatBreedPredictor(
-        model_path=model_path,
-        class_names=class_names,
-        device=args.device,
-        img_size=args.img_size,
-    )
-
-    # Run webcam
     try:
         predictor.run_webcam(camera_id=args.camera_id)
     except KeyboardInterrupt:
         logger.info("Webcam feed stopped by user")
 
 
-def main():
+def get_model_path_and_classes(args: argparse.Namespace) -> tuple[Path, Path, List[str]]:
+    """Get model path and class names from various sources."""
+    model_path, model_dir = None, None
+
+    # Handle training config file
+    if args.config_path:
+        config_dir = Path(args.config_path).parent
+        model_path = config_dir / "best_state.pth"
+        if not model_path.exists():
+            model_path = config_dir / "last_state.pth"
+        if model_path.exists():
+            model_dir = config_dir
+            logger.info(f"Using model from config directory: {os.path.relpath(model_path)}")
+
+    # Handle direct model path
+    if not model_path and args.model_path:
+        model_path = Path(args.model_path)
+        print(model_path)
+        if model_path.exists():
+            model_dir = model_path.parent
+            logger.info(f"Using specified model: {os.path.relpath(model_path)}")
+
+    # Find latest checkpoint
+    if not model_path or not model_dir:
+        model_dirs = sorted(
+            [
+                d
+                for d in Path(args.checkpoint_dir).iterdir()
+                if d.is_dir() and any(d.glob("*.pth"))
+            ],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+
+        if not model_dirs:
+            logger.error(f"No model checkpoints found in {args.checkpoint_dir}")
+            sys.exit(1)
+
+        model_dir = model_dirs[0]
+        model_path = model_dir / "best_state.pth"
+        if not model_path.exists():
+            model_path = model_dir / "last_state.pth"
+
+        if not model_path.exists():
+            logger.error(f"No model checkpoint files found in {model_dir.relative_to(Path.cwd())}")
+            sys.exit(1)
+
+        logger.info(f"Using latest model: {os.path.relpath(model_path)}")
+    print(model_dir)
+    # Load class names
+    class_names_path = Path(model_dir) / "class_names.json"
+    if class_names_path.exists():
+        with class_names_path.open("r") as f:
+            class_names = json.load(f)
+    else:
+        class_names = load_class_names_from_json(args)
+
+    return model_path, model_dir, class_names
+
+
+def load_class_names_from_json(args: argparse.Namespace) -> List[str]:
+    """Load class names from JSON dataset as fallback."""
+    try:
+        with Path(args.train_json).open("r") as f:
+            train_data = json.load(f)
+
+        metadata = train_data.get("metadata", {})
+        samples = train_data.get("samples", [])
+
+        if args.mode == "multitask":
+            class_names = metadata.get("breed_classes") or sorted(
+                {s.get("breed_class") for s in samples if "breed_class" in s}
+            )
+        else:
+            class_names = metadata.get("class_names") or sorted(
+                {s.get("class_name") for s in samples if "class_name" in s}
+            )
+
+        logger.info(f"Loaded class names from JSON dataset: {len(class_names)} classes")
+        return class_names
+
+    except Exception as e:
+        logger.error(f"Could not load class names from JSON dataset: {e}")
+        return []
+
+
+def validate_json_datasets(args: argparse.Namespace) -> None:
+    """Validate required JSON dataset files exist after config loading."""
+    required_files = [args.train_json, args.val_json, args.test_json]
+
+    if not all(required_files):
+        logger.error("JSON dataset files are required: --train-json, --val-json, --test-json")
+        logger.error("Provide them via command line or config file")
+        sys.exit(1)
+
+    missing_files = [f for f in required_files if not Path(f).exists()]
+    if missing_files:
+        logger.error(f"JSON dataset files not found: {', '.join(missing_files)}")
+        sys.exit(1)
+
+    if not Path(args.data_root).exists():
+        logger.error(f"Data root directory not found: {args.data_root}")
+        sys.exit(1)
+
+
+def main() -> None:
     """Main entry point."""
     args = parse_args()
     args = load_and_update_config(args)
-    # Set data directory based on mode
 
-    if args.mode == "emotion":
-        args.data_dir = Path(args.data_dir) / "data-emo" / "processed"
-    else:
-        args.data_dir = Path(args.data_dir) / "data-breed" / "processed"
-
-    if not args.data_dir.exists():
-        logger.error(f"Data directory not found: {os.path.relpath(args.data_dir)}")
-        sys.exit(1)
-
-    # Set up logging
+    validate_json_datasets(args)
     setup_logger(args.log_file)
 
-    # Print info
-    logger.info(f"Running command: {args.command}")
-    logger.info(f"Device: {args.device}")
+    # Log execution info
+    logger.info(f"Running command: {args.command} | Mode: {args.mode} | Device: {args.device}")
+    logger.info(
+        f"Datasets - Train: {args.train_json} | Val: {args.val_json} | Test: {args.test_json}"
+    )
+    logger.info(f"Data Root: {args.data_root}")
 
-    # Run command
-    if args.command == "train":
-        train(args)
-    elif args.command == "evaluate":
-        evaluate(args)
-    elif args.command == "predict":
-        predict(args)
-    elif args.command == "video":
-        process_video(args)
-    elif args.command == "webcam":
-        run_webcam(args)
+    # Command dispatch
+    commands = {
+        "train": train,
+        "evaluate": evaluate,
+        "predict": predict,
+        "video": process_video,
+        "webcam": run_webcam,
+    }
+
+    if args.command in commands:
+        commands[args.command](args)
     else:
         logger.error(f"Unknown command: {args.command}")
         sys.exit(1)

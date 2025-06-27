@@ -1,0 +1,30 @@
+# Single-task Emotion Classification Training Configuration (JSON-based)
+# This configuration is for training an emotion-only model using JSON datasets
+
+# Model Configuration
+backbone: "mobilenet_v2" # Model architecture: mobilenet_v2, mobilenet_v3_small, mobilenet_v3_large
+mode: "emotion" # Training mode: breed, emotion, multitask
+
+# Training Parameters
+batch_size: 32
+learning_rate: 3e-4
+weight_decay: 1e-4
+epochs: 50
+early_stopping: 10 # Patience for early stopping
+
+# Model Parameters
+img_size: 224
+
+# Data Configuration - JSON Datasets
+train_json: "../data/json_emotion_datasets/train_dataset.json"
+val_json: "../data/json_emotion_datasets/val_dataset.json"
+test_json: "../data/json_emotion_datasets/test_dataset.json"
+data_root: "../data/data-emo/processed" # Root directory for image paths in JSON
+
+# Training Configuration
+num_workers: 4
+device: "cuda" # or "cpu"
+
+# Logging and Checkpoints
+checkpoint_dir: "checkpoints"
+use_tensorboard: true
