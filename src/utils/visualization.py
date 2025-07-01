@@ -99,9 +99,7 @@ def plot_confusion_matrix(
     return fig
 
 
-def plot_learning_curves(
-    history: Dict[str, List[float]], figsize: tuple = (12, 4)
-) -> Figure:
+def plot_learning_curves(history: Dict[str, List[float]], figsize: tuple = (12, 4)) -> Figure:
     """
     Plot learning curves from training history.
 
@@ -151,13 +149,11 @@ def print_classification_report(
     Returns:
         Classification report as dictionary
     """
-    report = classification_report(
-        y_true, y_pred, target_names=class_names, output_dict=True
-    )
+    report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
 
     # Print the report as a formatted table
     df_report = pd.DataFrame(report).transpose()
-    print(df_report)
+    # print(df_report)
     return report
 
 

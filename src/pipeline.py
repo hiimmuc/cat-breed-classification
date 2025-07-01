@@ -1,52 +1,11 @@
-"""
-Pipeline for cat breed and emotion detection with YOLO-based cat detection and flexible model support.
-
-UNIFIED PIPELINE FLOW (Applied to ALL input types):
-======================================================
-
-1. INPUT PROCESSING
-   - Image: Single image file
-   - Video: Frame-by-frame processing
-   - Webcam: Real-time frame processing
-
-2. CAT DETECTION/TRACKING
-   - YOLO (if available): Fast and accurate cat detection using YOLOv8
-   - Fallback: Whole image assumed to contain cat
-
-3. BOUNDING BOX EXTRACTION
-   - Extract detected cat bounding boxes from YOLO results
-   - Filter for cats above confidence threshold
-   - Validate bbox coordinates within image bounds
-
-4. FRAME CROPPING
-   - Crop image regions based on detected bboxes
-   - Each detected cat gets its own cropped frame
-
-5. CLASSIFICATION (Two modes supported):
-   A. MULTITASK MODE (--multitask flag):
-      - Single model produces both breed and emotion predictions
-      - Single forward pass for both tasks
-   B. SINGLE MODEL MODE (default):
-      - Separate models for breed and emotion classification
-      - Two forward passes (one per task)
-
-6. RESULT VISUALIZATION
-   - Draw bounding boxes around detected cats
-   - Add refined labels (inside/above/below bbox as appropriate)
-   - Semi-transparent backgrounds for optimal readability
-
-This ensures consistent processing regardless of input type and model configuration.
-All images/frames follow the same 6-step pipeline flow with flexible model support.
-"""
-
 import argparse
 import json
 import logging
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
-from test import CatBreedPredictor
 from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
@@ -58,7 +17,7 @@ import yaml
 from PIL import Image
 
 # Import local modules
-from model import load_model
+from engine.model import load_model
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -107,18 +66,19 @@ def load_class_names_from_config(
 
 class CatAnalysisPipeline:
     """
-    Pipeline for detecting, tracking and analyzing cats in images/videos with flexible model support.
+    Pipeline for tracking, detecting and analyzing cats in images/videos with flexible model support.
 
     Pipeline Flow:
     1. Input Processing (Image/Video/Webcam)
-    2. Cat Detection/Tracking (YOLO or fallback to full image)
-    3. Bounding Box Extraction (from YOLO detection results)
-    4. Frame Cropping (based on detected bboxes)
+    2. Cat Tracking/Detection (YOLO tracking with persistent IDs or fallback to full image)
+    3. Bounding Box Extraction (from YOLO tracking results)
+    4. Frame Cropping (based on tracked bboxes)
     5. Classification (Multitask model OR separate breed/emotion models)
-    6. Result Visualization (with refined label positioning)
+    6. Result Visualization (with tracking lines, refined label positioning, and track IDs)
 
     This ensures consistent processing across all input types with flexible model configuration.
     Supports both multitask models (single model for both tasks) and separate models.
+    Tracking maintains persistent IDs across frames for videos and webcam feeds.
     """
 
     def __init__(
@@ -164,6 +124,15 @@ class CatAnalysisPipeline:
         self.yolo_model_path = config["models"]["yolo_model"]
         self.yolo_config = config["yolo"]
 
+        # Initialize tracking state
+        self.track_history = defaultdict(lambda: [])
+        self.max_track_length = 30  # Retain 30 points for track visualization
+
+        # FPS calculation
+        self.fps_start_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0.0
+
         # Image preprocessing
         self.transform = transforms.Compose(
             [
@@ -173,7 +142,7 @@ class CatAnalysisPipeline:
             ]
         )
 
-        # Initialize YOLO detection model if available and enabled
+        # Initialize YOLO tracking model if available and enabled
         if YOLO_AVAILABLE and self.yolo_config["enabled"]:
             self._init_yolo_model()
         else:
@@ -238,7 +207,7 @@ class CatAnalysisPipeline:
         self.model = None
 
     def _init_yolo_model(self):
-        """Initialize YOLO model for cat detection."""
+        """Initialize YOLO model for cat tracking."""
         try:
             if not YOLO_AVAILABLE:
                 logger.warning("YOLO not available")
@@ -252,46 +221,50 @@ class CatAnalysisPipeline:
             # COCO dataset class IDs for cats (from config)
             self.cat_class_id = self.yolo_config["cat_class_id"]
 
-            logger.info("YOLO model initialized successfully")
+            logger.info("YOLO tracking model initialized successfully")
         except Exception as e:
             logger.warning(f"Failed to initialize YOLO model: {e}")
             self.yolo_model = None
 
-    def detect_animals(self, image: np.ndarray) -> List[Dict]:
+    def track_animals(self, image: np.ndarray) -> List[Dict]:
         """
-        Step 2: Detect/Track cats in the image using YOLO or fallback.
+        Step 2: Track cats in the image using YOLO tracking or fallback.
 
-        This is the core detection step that runs for ALL input types:
-        - For images: Single detection per image
-        - For videos: Detection per frame
-        - For webcam: Real-time detection per frame
+        This is the core tracking step that runs for ALL input types:
+        - For images: Single detection per image (no tracking needed)
+        - For videos: Tracking per frame with persistent IDs
+        - For webcam: Real-time tracking per frame with persistent IDs
 
         Args:
             image: Input image as numpy array
 
         Returns:
-            List of detection dictionaries with bounding boxes and scores
-            Format: [{"bbox": [x1, y1, x2, y2], "score": float, "label": str}]
+            List of detection dictionaries with bounding boxes, scores, and track IDs
+            Format: [{"bbox": [x1, y1, x2, y2], "score": float, "label": str, "track_id": int}]
         """
         if not YOLO_AVAILABLE or self.yolo_model is None:
             # Fallback: assume the whole image contains a cat
             h, w = image.shape[:2]
-            return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat"}]
+            return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat", "track_id": 0}]
 
         try:
             # Convert BGR to RGB for YOLO (YOLO expects RGB)
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            # Run YOLO inference
-            results = self.yolo_model(rgb_image, verbose=False)
+            # Run YOLO tracking inference (persist=True maintains tracks between frames)
+            results = self.yolo_model.track(rgb_image, persist=True, verbose=False)
+            # results = self.yolo_model(rgb_image, verbose=False)
 
             detections = []
 
-            # Process YOLO results
+            # Process YOLO tracking results
             for result in results:
-                # Get detection boxes, scores, and class IDs
+                # Get detection boxes, scores, class IDs, and track IDs
                 boxes = result.boxes
-                if boxes is not None:
+                if boxes is not None and boxes.is_track:
+                    # Get track IDs
+                    track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else []
+
                     # Filter for cats only (class ID 15 in COCO)
                     for i, class_id in enumerate(boxes.cls):
                         if int(class_id) == self.cat_class_id:
@@ -310,8 +283,26 @@ class CatAnalysisPipeline:
                                 x2 = max(x1 + 1, min(int(x2), w))
                                 y2 = max(y1 + 1, min(int(y2), h))
 
+                                # Get track ID if available
+                                track_id = track_ids[i] if i < len(track_ids) else 0
+
+                                # Update track history for visualization
+                                center_x = (x1 + x2) / 2
+                                center_y = (y1 + y2) / 2
+                                track = self.track_history[track_id]
+                                track.append((float(center_x), float(center_y)))
+
+                                # Limit track history length
+                                if len(track) > self.max_track_length:
+                                    track.pop(0)
+
                                 detections.append(
-                                    {"bbox": [x1, y1, x2, y2], "score": confidence, "label": "cat"}
+                                    {
+                                        "bbox": [x1, y1, x2, y2],
+                                        "score": confidence,
+                                        "label": "cat",
+                                        "track_id": track_id,
+                                    }
                                 )
 
             # Sort by confidence (highest first)
@@ -320,12 +311,14 @@ class CatAnalysisPipeline:
             return detections
 
         except Exception as e:
-            logger.warning(f"YOLO detection failed: {e}")
+            logger.warning(f"YOLO tracking failed: {e}")
             # Fallback: assume the whole image contains a cat
             h, w = image.shape[:2]
-            return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat"}]
+            return [{"bbox": [0, 0, w, h], "score": 1.0, "label": "cat", "track_id": 0}]
 
-    def classify_breed_and_emotion(self, image_crop: np.ndarray) -> Tuple[str, float, str, float]:
+    def classify_breed_and_emotion(
+        self, image_crop: np.ndarray
+    ) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]]]:
         """
         Steps 5-6: Classify breed and emotion from a cropped cat image.
 
@@ -337,7 +330,7 @@ class CatAnalysisPipeline:
             image_crop: Cropped cat image as numpy array (from detected bbox)
 
         Returns:
-            Tuple of (breed_label, breed_confidence, emotion_label, emotion_confidence)
+            Tuple of (breed_top3, emotion_top3) where each is a list of (label, confidence) tuples
         """
         # Convert to PIL and apply transforms
         pil_image = Image.fromarray(cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB))
@@ -346,25 +339,30 @@ class CatAnalysisPipeline:
         with torch.no_grad():
             if self.use_multitask:
                 # Use multitask model for both predictions
-                breed_logits, emotion_logits = self.model(input_tensor, task="both")
+                breed_logits = self.model(input_tensor, task="breed")
+                emotion_logits = self.model(input_tensor, task="emotion")
             else:
                 # Use separate models for breed and emotion
                 breed_logits = self.breed_model(input_tensor)
                 emotion_logits = self.emotion_model(input_tensor)
 
-            # Process breed predictions
+            # Process breed predictions - get top 3
             breed_probs = F.softmax(breed_logits, dim=1)
-            breed_confidence, breed_idx = torch.max(breed_probs, 1)
-            breed_label = self.breed_classes[breed_idx.item()]
-            breed_conf = breed_confidence.item()
+            breed_top3_probs, breed_top3_indices = torch.topk(breed_probs, k=3, dim=1)
+            breed_top3 = [
+                (self.breed_classes[idx.item()], prob.item())
+                for idx, prob in zip(breed_top3_indices[0], breed_top3_probs[0])
+            ]
 
-            # Process emotion predictions
+            # Process emotion predictions - get top 3
             emotion_probs = F.softmax(emotion_logits, dim=1)
-            emotion_confidence, emotion_idx = torch.max(emotion_probs, 1)
-            emotion_label = self.emotion_classes[emotion_idx.item()]
-            emotion_conf = emotion_confidence.item()
+            emotion_top3_probs, emotion_top3_indices = torch.topk(emotion_probs, k=3, dim=1)
+            emotion_top3 = [
+                (self.emotion_classes[idx.item()], prob.item())
+                for idx, prob in zip(emotion_top3_indices[0], emotion_top3_probs[0])
+            ]
 
-        return breed_label, breed_conf, emotion_label, emotion_conf
+        return breed_top3, emotion_top3
 
     def process_image(self, image: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
         """
@@ -372,11 +370,11 @@ class CatAnalysisPipeline:
 
         This method implements the full pipeline flow:
         1. Input: Single image/frame
-        2. Detection: Animal detection/tracking
-        3. Bbox Extraction: Get bounding boxes from detections
+        2. Tracking: Animal tracking/detection
+        3. Bbox Extraction: Get bounding boxes from tracking results
         4. Cropping: Extract cat regions based on bboxes
         5. Classification: Breed and emotion classification (multitask OR single models)
-        6. Visualization: Draw results with refined label positioning
+        6. Visualization: Draw results with refined label positioning and track visualization
 
         Used by: image processing, video frame processing, webcam frame processing
 
@@ -386,16 +384,20 @@ class CatAnalysisPipeline:
         Returns:
             Tuple of (annotated_image, detection_results)
         """
-        # Step 2: Detect animals using MMPose or fallback
-        detections = self.detect_animals(image)
+        # Calculate FPS
+        fps = self._calculate_fps()
+
+        # Step 2: Track animals using YOLO tracking or fallback
+        detections = self.track_animals(image)
 
         results = []
         annotated_image = image.copy()
 
-        # Step 3: Process each detected bounding box
+        # Step 3: Process each detected/tracked bounding box
         for detection in detections:
             bbox = detection["bbox"]
             x1, y1, x2, y2 = map(int, bbox)
+            track_id = detection.get("track_id", 0)
 
             # Step 3a: Ensure bbox is within image bounds
             h, w = image.shape[:2]
@@ -408,152 +410,211 @@ class CatAnalysisPipeline:
             crop = image[y1:y2, x1:x2]
 
             if crop.size > 0:
-                # Step 5: Classification on cropped frame (breed and emotion)
-                breed_label, breed_conf, emotion_label, emotion_conf = (
-                    self.classify_breed_and_emotion(crop)
-                )
+                # Step 5: Classification on cropped frame (breed and emotion) - now returns top-3
+                breed_top3, emotion_top3 = self.classify_breed_and_emotion(crop)
 
                 # Store results for this detection
                 result = {
                     "bbox": [x1, y1, x2, y2],
                     "detection_score": detection["score"],
-                    "breed": breed_label,
-                    "breed_confidence": breed_conf,
-                    "emotion": emotion_label,
-                    "emotion_confidence": emotion_conf,
+                    "breed_top3": breed_top3,
+                    "emotion_top3": emotion_top3,
+                    "track_id": track_id,
                 }
                 results.append(result)
 
-                # Step 6: Visualization - Draw bounding box and refined labels
+                # Step 6: Visualization - Draw tracking lines first
+                if track_id in self.track_history and len(self.track_history[track_id]) > 1:
+                    # Draw tracking lines
+                    track_points = self.track_history[track_id]
+                    points = np.array(track_points, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(
+                        annotated_image,
+                        [points],
+                        isClosed=False,
+                        color=(230, 230, 230),
+                        thickness=3,
+                    )
+
+                # Draw bounding box
                 cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                # Create label text
-                breed_text = f"{breed_label} ({breed_conf:.2f})"
-                emotion_text = f"{emotion_label} ({emotion_conf:.2f})"
-
-                # Calculate text sizes for proper positioning
+                # Draw detection confidence on bounding box (top-left corner)
+                confidence_text = f"cat: {detection['score']:.0%}"
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.6
                 thickness = 2
 
-                breed_size = cv2.getTextSize(breed_text, font, font_scale, thickness)[0]
-                emotion_size = cv2.getTextSize(emotion_text, font, font_scale, thickness)[0]
+                # Get text size for background
+                text_size = cv2.getTextSize(confidence_text, font, font_scale, thickness)[0]
 
-                # Calculate label background dimensions
-                max_text_width = max(breed_size[0], emotion_size[0])
-                line_height = max(breed_size[1], emotion_size[1])
-                padding = 8
-                label_height = (2 * line_height) + (3 * padding)  # Two lines + padding
-                label_width = max_text_width + padding
+                # Draw background rectangle for confidence text
+                cv2.rectangle(
+                    annotated_image,
+                    (x1, y1 - text_size[1] - 10),
+                    (x1 + text_size[0] + 10, y1),
+                    (0, 255, 0),  # Green background
+                    -1,
+                )
 
-                # Get image and bounding box dimensions
-                img_height, img_width = annotated_image.shape[:2]
-                bbox_width = x2 - x1
-                bbox_height = y2 - y1
-
-                # Determine optimal label position
-                if bbox_width >= label_width + 10 and bbox_height >= label_height + 10:
-                    # Labels fit inside the bounding box - place at top-left
-                    label_x = x1 + 5
-                    label_y = y1 + 5
-                    bg_color = (0, 0, 0)  # Black background for inside box
-                    text_color = (255, 255, 255)  # White text for inside box
-                    use_transparency = True
-
-                    # Draw semi-transparent background
-                    overlay = annotated_image.copy()
-                    cv2.rectangle(
-                        overlay,
-                        (label_x, label_y),
-                        (label_x + label_width, label_y + label_height),
-                        bg_color,
-                        -1,
-                    )
-                    cv2.addWeighted(overlay, 0.7, annotated_image, 0.3, 0, annotated_image)
-
-                elif y1 >= label_height + 10:
-                    # Place labels above the bounding box
-                    label_x = x1
-                    label_y = y1 - label_height - 5
-                    bg_color = (0, 255, 0)  # Green background for outside box
-                    text_color = (0, 0, 0)  # Black text for outside box
-                    use_transparency = False
-
-                    # Ensure label doesn't go outside image bounds
-                    if label_x + label_width > img_width:
-                        label_x = img_width - label_width
-                    if label_x < 0:
-                        label_x = 0
-
-                    # Draw solid background
-                    cv2.rectangle(
-                        annotated_image,
-                        (label_x, label_y),
-                        (label_x + label_width, label_y + label_height),
-                        bg_color,
-                        -1,
-                    )
-
-                else:
-                    # Place labels below the bounding box if not enough space above
-                    label_x = x1
-                    label_y = y2 + 5
-                    bg_color = (0, 255, 0)  # Green background for outside box
-                    text_color = (0, 0, 0)  # Black text for outside box
-                    use_transparency = False
-
-                    # Ensure label doesn't go outside image bounds
-                    if label_x + label_width > img_width:
-                        label_x = img_width - label_width
-                    if label_x < 0:
-                        label_x = 0
-                    if label_y + label_height > img_height:
-                        label_y = img_height - label_height
-
-                    # Draw solid background
-                    cv2.rectangle(
-                        annotated_image,
-                        (label_x, label_y),
-                        (label_x + label_width, label_y + label_height),
-                        bg_color,
-                        -1,
-                    )
-
-                # Draw text labels
-                text_x = label_x + padding // 2
-                breed_y = label_y + line_height + padding
-                emotion_y = breed_y + line_height + padding
-
+                # Draw confidence text
                 cv2.putText(
                     annotated_image,
-                    breed_text,
-                    (text_x, breed_y),
+                    confidence_text,
+                    (x1 + 5, y1 - 5),
                     font,
                     font_scale,
-                    text_color,
+                    (0, 0, 0),  # Black text
                     thickness,
                 )
-                cv2.putText(
-                    annotated_image,
-                    emotion_text,
-                    (text_x, emotion_y),
-                    font,
-                    font_scale,
-                    text_color,
-                    thickness,
-                )
+
+        # Draw information panel at top-left
+        annotated_image = self._draw_info_panel(annotated_image, results, fps)
 
         return annotated_image, results
+
+    def _calculate_fps(self) -> float:
+        """Calculate current FPS."""
+        self.fps_frame_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.fps_start_time
+
+        if elapsed >= 1.0:  # Update FPS every second
+            self.current_fps = self.fps_frame_count / elapsed
+            self.fps_frame_count = 0
+            self.fps_start_time = current_time
+
+        return self.current_fps
+
+    def _draw_info_panel(self, image: np.ndarray, results: List[Dict], fps: float) -> np.ndarray:
+        """
+        Draw information panel at top-left with FPS and classification results.
+        Panel size is proportional to the frame size (approx. 20% of width).
+
+        Args:
+            image: Input image
+            results: Detection results with breed and emotion top-3 predictions
+            fps: Current FPS value
+
+        Returns:
+            Image with information panel drawn
+        """
+        if not results:
+            return image
+
+        # Get image dimensions
+        h, w = image.shape[:2]
+
+        # Make panel proportional to frame size
+        target_panel_width_ratio = 0.20  # 20% of frame width
+
+        # Panel configuration
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # Scale font based on image width
+        font_scale = max(0.4, min(0.7, w / 1920))  # Scale between 0.4-0.7 based on width
+        thickness = 1
+        line_height = int(20 * (w / 1280))  # Scale line height based on width
+        padding = int(10 * (w / 1280))  # Scale padding based on width
+        panel_x = padding
+        panel_y = padding
+
+        # Prepare text lines
+        info_lines = []
+        info_lines.append(f"FPS: {fps:.1f}")
+        info_lines.append("")  # Empty line for spacing
+
+        # Add results for each detection
+        for i, result in enumerate(results):
+            track_id = result.get("track_id", "N/A")
+            info_lines.append(f"Detection {i+1} (ID: {track_id}):")
+
+            # Breed top-3
+            info_lines.append("Breed:")
+            for j, (breed, conf) in enumerate(result["breed_top3"]):
+                info_lines.append(f"  {j+1}. {breed} {conf*100:.2f}%")
+
+            # Emotion top-3
+            info_lines.append("Emotion:")
+            for j, (emotion, conf) in enumerate(result["emotion_top3"]):
+                info_lines.append(f"  {j+1}. {emotion} {conf*100:.2f}%")
+
+            if i < len(results) - 1:  # Add spacing between detections
+                info_lines.append("")
+
+        # Target panel width (20% of frame width)
+        target_panel_width = int(w * target_panel_width_ratio)
+
+        # Calculate initial panel dimensions
+        max_text_width = 0
+        for line in info_lines:
+            text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+            max_text_width = max(max_text_width, text_size[0])
+
+        # Adjust font scale if text is too wide for target panel width
+        if max_text_width > (target_panel_width - 2 * padding):
+            scale_factor = (target_panel_width - 2 * padding) / max_text_width
+            font_scale *= scale_factor
+
+            # Recalculate max text width with new font scale
+            max_text_width = 0
+            for line in info_lines:
+                text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+                max_text_width = max(max_text_width, text_size[0])
+
+        # Set panel width to target or text width, whichever is larger
+        panel_width = max(target_panel_width, max_text_width + (2 * padding))
+        panel_height = len(info_lines) * line_height + (2 * padding)
+
+        # Ensure panel doesn't exceed frame dimensions
+        panel_width = min(panel_width, w - 2 * padding)
+        panel_height = min(panel_height, h - 2 * padding)
+
+        # Draw transparent black background
+        overlay = image.copy()
+        cv2.rectangle(
+            overlay,
+            (panel_x, panel_y),
+            (panel_x + panel_width, panel_y + panel_height),
+            (0, 0, 0),  # Black color
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+
+        # Draw text lines
+        for i, line in enumerate(info_lines):
+            if line.strip():  # Skip empty lines
+                text_y = panel_y + padding + (i + 1) * line_height
+
+                # Check if text fits within panel width
+                text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+                if text_size[0] > panel_width - 2 * padding:
+                    # Truncate text if it's too long
+                    while text_size[0] > panel_width - 2 * padding and len(line) > 3:
+                        line = line[:-4] + "..."
+                        text_size = cv2.getTextSize(line, font, font_scale, thickness)[0]
+
+                cv2.putText(
+                    image,
+                    line,
+                    (panel_x + padding, text_y),
+                    font,
+                    font_scale,
+                    (255, 255, 255),  # White text
+                    thickness,
+                )
+
+        return image
 
     def process_video(
         self, video_path: str, output_path: Optional[str] = None, display: bool = True
     ) -> Optional[str]:
         """
-        Process a video file using the same pipeline flow as single images.
+        Process a video file using the same pipeline flow as single images with tracking.
 
         Pipeline Flow (applied to each frame):
         1. Input: Video frame
-        2-6. Same as process_image() for each frame
+        2-6. Same as process_image() for each frame with persistent tracking
 
         Args:
             video_path: Path to input video
@@ -626,11 +687,11 @@ class CatAnalysisPipeline:
 
     def process_webcam(self, camera_id: int = 0):
         """
-        Process webcam feed in real-time using the same pipeline flow.
+        Process webcam feed in real-time using the same pipeline flow with tracking.
 
         Pipeline Flow (applied to each frame):
         1. Input: Webcam frame
-        2-6. Same as process_image() for each frame in real-time
+        2-6. Same as process_image() for each frame in real-time with persistent tracking
 
         Args:
             camera_id: Camera device ID
@@ -665,19 +726,24 @@ class CatAnalysisPipeline:
 
 def main():
     """
-    Main function for running the unified cat analysis pipeline.
+    Main function for running the unified cat analysis pipeline with tracking.
 
     ALL commands (image, video, webcam) use the same 6-step pipeline flow:
-    YOLO Detection → Bbox Extraction → Cropping → Classification → Visualization
+    YOLO Tracking → Bbox Extraction → Cropping → Classification → Visualization
 
     Classification can be done in two modes:
     - Multitask mode (--multitask): Single model for both breed and emotion
     - Single model mode (default): Separate models for breed and emotion
 
     The only difference between commands is the input source:
-    - image: Single image file processing
-    - video: Frame-by-frame video processing
-    - webcam: Real-time webcam frame processing
+    - image: Single image file processing (no persistent tracking)
+    - video: Frame-by-frame video processing with persistent tracking
+    - webcam: Real-time webcam frame processing with persistent tracking
+
+    Tracking features:
+    - Persistent track IDs across frames for videos and webcam
+    - Visual tracking lines showing movement paths
+    - Track ID display on bounding boxes
     """
     parser = argparse.ArgumentParser(description="Cat Analysis Pipeline")
 
@@ -765,15 +831,22 @@ def main():
         else:
             w, h = annotated_image.shape[1], annotated_image.shape[0]
 
-            cv2.imshow("Cat Analysis Result", cv2.resize(annotated_image, (w // 2, h // 2)))
+            # cv2.imshow("Cat Analysis Result", cv2.resize(annotated_image, (w // 2, h // 2)))
+            cv2.imshow("Cat Analysis Result", annotated_image)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
         # Print results
         for i, result in enumerate(results):
+            breed_top3 = result["breed_top3"]
+            emotion_top3 = result["emotion_top3"]
+
+            breed_str = ", ".join([f"{label} {conf*100:.2f}%" for label, conf in breed_top3])
+            emotion_str = ", ".join([f"{label} {conf*100:.2f}%" for label, conf in emotion_top3])
+
             logger.info(
-                f"Detection {i+1}: Breed={result['breed']} ({result['breed_confidence']:.2f}), "
-                f"Emotion={result['emotion']} ({result['emotion_confidence']:.2f})"
+                f"Detection {i+1} (Track ID: {result.get('track_id', 'N/A')}): "
+                f"Breed=[{breed_str}], Emotion=[{emotion_str}]"
             )
 
     elif args.command == "video":

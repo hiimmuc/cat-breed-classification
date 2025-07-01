@@ -19,6 +19,51 @@ from utils.data_utils import get_multitask_data_loaders
 logger = logging.getLogger(__name__)
 
 
+class FocalLoss(nn.Module):
+    """Focal Loss for multi-class classification."""
+
+    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = "mean"):
+        """
+        Initialize Focal Loss.
+
+        Args:
+            alpha: Weighting factor for rare class (default: 1.0)
+            gamma: Focusing parameter (default: 2.0)
+            reduction: Reduction method ('mean', 'sum', 'none')
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of Focal Loss.
+
+        Args:
+            inputs: Logits tensor of shape (batch_size, num_classes)
+            targets: Target tensor of shape (batch_size,) with class indices
+
+        Returns:
+            Focal loss tensor
+        """
+        # Compute cross entropy loss
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+
+        # Compute softmax probabilities
+        pt = torch.exp(-ce_loss)
+
+        # Compute focal loss
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+
+        if self.reduction == "mean":
+            return torch.mean(focal_loss)
+        elif self.reduction == "sum":
+            return torch.sum(focal_loss)
+        else:
+            return focal_loss
+
+
 class MultitaskLoss(nn.Module):
     """Combined loss for multitask learning with task weighting."""
 
@@ -44,11 +89,8 @@ class MultitaskLoss(nn.Module):
             self.breed_loss_fn = nn.CrossEntropyLoss()
             self.emotion_loss_fn = nn.CrossEntropyLoss()
         elif loss_type == "focal":
-            # For now, use cross entropy - can implement focal loss later if needed
-            logger.warning("Focal loss not implemented, using cross entropy instead")
-            self.breed_loss_fn = nn.CrossEntropyLoss()
-            self.emotion_loss_fn = nn.CrossEntropyLoss()
-            self.emotion_loss_fn = FocalLoss(alpha=1, gamma=2)
+            self.breed_loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
+            self.emotion_loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
         else:
             raise ValueError(f"Unsupported loss type: {loss_type}")
 
@@ -190,7 +232,8 @@ class CatMultitaskTrainer:
             emotion_labels = emotion_labels.to(self.device)
 
             # Forward pass
-            breed_logits, emotion_logits = self.model(images, task="both")
+            breed_logits = self.model(images, task="breed")
+            emotion_logits = self.model(images, task="emotion")
 
             # Compute loss
             loss, losses = self.loss_fn(breed_logits, emotion_logits, breed_labels, emotion_labels)
@@ -279,7 +322,8 @@ class CatMultitaskTrainer:
                 emotion_labels = emotion_labels.to(self.device)
 
                 # Forward pass
-                breed_logits, emotion_logits = self.model(images, task="both")
+                breed_logits = self.model(images, task="breed")
+                emotion_logits = self.model(images, task="emotion")
 
                 # Compute loss
                 loss, losses = self.loss_fn(
@@ -364,12 +408,7 @@ class CatMultitaskTrainer:
             val_metrics = self.validate_epoch()
 
             # Update learning rate
-            if self.lr_scheduler:
-                if hasattr(self.lr_scheduler, "step"):
-                    if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        self.lr_scheduler.step(val_metrics["loss"])
-                    else:
-                        self.lr_scheduler.step()
+            self._step_scheduler(train_metrics["loss"])
 
             # Record history
             self.history["train_loss"].append(train_metrics["loss"])
@@ -556,3 +595,19 @@ class CatMultitaskTrainer:
         plt.close()
 
         logger.info(f"Training curves saved to {self.checkpoint_dir / 'learning_curves.png'}")
+
+    def _step_scheduler(self, loss: float = None) -> None:
+        """Update the learning rate scheduler based on its type.
+
+        Args:
+            loss: The loss value for loss-based schedulers.
+        """
+        if not self.lr_scheduler:
+            return
+
+        if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            # ReduceLROnPlateau requires a loss value
+            self.lr_scheduler.step(loss)
+        else:
+            # Other schedulers like StepLR or CosineAnnealingLR don't need metrics
+            self.lr_scheduler.step()

@@ -4,11 +4,11 @@
 # Model Paths - Support both single models and multitask models
 models:
     # Multitask model (single model for both tasks)
-    multitask_model: "src/checkpoints/multitask_regnet_y_3_2gf_20250627_034328/best_state.pth"
+    multitask_model: "src/checkpoints/multitask_mobilenet_v3_large_20250702_050721/best_state.pth"
 
     # Single models (separate models for each task)
-    breed_model: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/best_state.pth"
-    emotion_model: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/best_state.pth"
+    breed_model: "src/checkpoints/breed_mobilenet_v3_large_20250702_043508/best_state.pth"
+    emotion_model: "src/checkpoints/emotion_mobilenet_v3_large_20250702_045438/best_state.pth"
 
     # YOLO detection model
     yolo_model: "src/checkpoints/yolo/yolo12x.pt"
@@ -18,13 +18,13 @@ models:
 class_names:
     # For multitask models
     multitask:
-        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/class_names.json"
-        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/class_names.json"
+        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250702_063934/class_names.json"
+        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250702_072525/class_names.json"
 
     # For single models
     single:
-        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250626_235428/class_names.json"
-        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250626_222202/class_names.json"
+        breed_classes: "src/checkpoints/breed_efficientnet_v2_s_20250702_063934/class_names.json"
+        emotion_classes: "src/checkpoints/emotion_regnet_y_3_2gf_20250702_072525/class_names.json"
 
 # Pipeline Settings
 pipeline:
@@ -36,7 +36,7 @@ pipeline:
 model_config:
     # Multitask model configuration
     multitask:
-        backbone: "regnet_y_3_2gf"
+        backbone: "mobilenet_v3_large" # Model architecture: mobilenet_v2, mobilenet_v3_small, mobilenet_v3_large
         pretrained: false
         shared_features: false
         mode: "multitask"
@@ -44,10 +44,10 @@ model_config:
     # Single model configurations
     single:
         breed:
-            backbone: "efficientnet_v2_s"
+            backbone: "mobilenet_v3_large"
             pretrained: false
         emotion:
-            backbone: "regnet_y_3_2gf"
+            backbone: "mobilenet_v3_large"
             pretrained: false
 
 # YOLO Configuration

@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.optim as optim
@@ -16,15 +16,22 @@ HOME = Path(__file__).resolve().parent
 
 # Import local modules
 sys.path.insert(0, str(HOME))
-import test
-from test import CatBreedPredictor
-
-from evaluate import Evaluator
-from model import create_model, load_model
-from trainer import CatModelTrainer
+from engine.evaluate import Evaluator
+from engine.model import create_model, load_model
+from engine.test import CatBreedPredictor
+from engine.trainer import CatModelTrainer
 from utils.data_utils import (
     get_multitask_data_loaders_from_json,
     get_single_task_data_loaders_from_json,
+)
+from utils.parser import (
+    create_model_config,
+    create_optimizer_and_scheduler,
+    create_optimizer_config,
+    load_and_update_config,
+    parse_args,
+    validate_input_path,
+    validate_json_datasets,
 )
 from utils.visualization import setup_logger
 
@@ -36,147 +43,6 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 # Create logger
 logger = logging.getLogger(__name__)
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Cat Classification Pipeline")
-
-    parser.add_argument("command", choices=["train", "evaluate", "predict", "video", "webcam"])
-    parser.add_argument("--config-path", type=str, help="YAML config file path")
-
-    # Core arguments
-    parser.add_argument("--data-root", type=str, default=str(DATA_DIR))
-    parser.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
-    parser.add_argument("--model-path", type=str, help="Model checkpoint path")
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
-    )
-    parser.add_argument(
-        "--mode", type=str, choices=["breed", "emotion", "multitask"], default="breed"
-    )
-
-    # Model config
-    parser.add_argument("--backbone", type=str, default="mobilenet_v2")
-    parser.add_argument("--img-size", type=int, default=224)
-
-    # Dataset paths (can be provided via config file)
-    parser.add_argument("--train-json", type=str, help="Path to training JSON dataset file")
-    parser.add_argument("--val-json", type=str, help="Path to validation JSON dataset file")
-    parser.add_argument("--test-json", type=str, help="Path to test JSON dataset file")
-
-    # Training params
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=4)
-
-    # Multitask weights
-    parser.add_argument("--breed-weight", type=float, default=1.0)
-    parser.add_argument("--emotion-weight", type=float, default=1.0)
-    parser.add_argument("--shared-features", action="store_true", default=False)
-
-    # I/O
-    parser.add_argument("--input", type=str, help="Input image/video path")
-    parser.add_argument("--output", type=str, help="Output path")
-    parser.add_argument("--output-dir", type=str, help="Output directory")
-    parser.add_argument("--camera-id", type=int, default=0)
-    parser.add_argument("--log-file", type=str, help="Log file path")
-
-    return parser.parse_args()
-
-
-def load_and_update_config(args) -> argparse.Namespace:
-    """Load configuration from YAML file and update args with CLI precedence."""
-    if not args.config_path:
-        return args
-
-    config_path = Path(args.config_path)
-    if not config_path.exists():
-        logger.warning(f"Configuration file not found: {config_path}")
-        return args
-
-    try:
-        logger.info(f"Loading configuration from {config_path}")
-        with config_path.open("r") as f:
-            config = yaml.safe_load(f)
-
-        if not config:
-            logger.warning(f"Empty or invalid configuration file: {config_path}")
-            return args
-
-        # Handle special case for training_config.yaml during evaluation
-        if "training_config.yaml" in str(config_path) and args.command == "evaluate":
-            if not args.checkpoint_dir or args.checkpoint_dir == str(CHECKPOINT_DIR):
-                args.checkpoint_dir = str(config_path.parent)
-                logger.info(
-                    f"Using training config directory as checkpoint_dir: {config_path.parent}"
-                )
-
-        # Configuration mapping with type conversion info
-        config_mapping = {
-            # Basic config -> (arg_name, default_value, type_converter)
-            "backbone": ("backbone", "mobilenet_v2", str),
-            "batch_size": ("batch_size", 32, int),
-            "learning_rate": ("lr", 3e-4, float),
-            "weight_decay": ("weight_decay", 1e-4, float),
-            "epochs": ("epochs", 50, int),
-            "early_stopping": ("patience", 10, int),
-            "device": ("device", "cuda" if torch.cuda.is_available() else "cpu", str),
-            "img_size": ("img_size", 224, int),
-            "num_workers": ("num_workers", 4, int),
-            "checkpoint_dir": ("checkpoint_dir", str(CHECKPOINT_DIR), str),
-            "data_root": ("data_root", str(DATA_DIR), str),
-            "output_dir": ("output_dir", None, str),
-            "model_path": ("model_path", None, str),
-            "mode": ("mode", "breed", str),
-            "breed_weight": ("breed_weight", 1.0, float),
-            "emotion_weight": ("emotion_weight", 1.0, float),
-            "shared_features": ("shared_features", True, bool),
-            "train_json": ("train_json", None, str),
-            "val_json": ("val_json", None, str),
-            "test_json": ("test_json", None, str),
-        }
-
-        # Apply config values only if args use defaults (CLI takes precedence)
-        for config_key, (arg_name, default_value, type_converter) in config_mapping.items():
-            if hasattr(args, arg_name) and config_key in config:
-                current_value = getattr(args, arg_name)
-                if current_value == default_value:
-                    config_value = type_converter(config[config_key])
-                    setattr(args, arg_name, config_value)
-                    logger.debug(f"Applied config: {arg_name} = {config_value}")
-                elif current_value != default_value:
-                    logger.debug(f"Keeping CLI argument: {arg_name} = {current_value}")
-
-        logger.info("Configuration loaded successfully")
-        return args
-
-    except Exception as e:
-        logger.error(f"Error loading configuration: {e}")
-        return args
-
-
-def create_optimizer_and_scheduler(
-    model: torch.nn.Module, lr: float, weight_decay: float
-) -> tuple:
-    """Create optimizer and learning rate scheduler."""
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.2, patience=20, min_lr=1e-6
-    )
-    return optimizer, scheduler
-
-
-def create_model_config(args: argparse.Namespace, shared_features: bool = False) -> Dict[str, any]:
-    """Create model configuration dictionary."""
-    return {
-        "backbone": args.backbone,
-        "pretrained": True,
-        "shared_features": shared_features,
-    }
 
 
 def train(args: argparse.Namespace) -> None:
@@ -217,7 +83,30 @@ def train_single_task(args: argparse.Namespace) -> None:
     model = create_model(
         num_classes=len(class_names), model_config=model_config, model_type=args.mode
     )
-    optimizer, scheduler = create_optimizer_and_scheduler(model, args.lr, args.weight_decay)
+
+    # Configure scheduler parameters from config file
+    scheduler_config = {
+        "patience": args.scheduler_patience,
+        "factor": args.scheduler_factor,
+        "min_lr": args.scheduler_min_lr,
+        "step_size": args.scheduler_step_size,
+        "gamma": args.scheduler_gamma,
+        "T_max": getattr(args, "scheduler_t_max", 10),
+    }
+
+    # Log optimizer and scheduler configuration from config file
+    logger.info(f"Using optimizer configuration from config file: {args.optimizer}")
+    logger.info(f"Using scheduler configuration from config file: {args.scheduler}")
+
+    # Create optimizer and scheduler
+    optimizer, scheduler = create_optimizer_and_scheduler(
+        model,
+        args.lr,
+        args.weight_decay,
+        optimizer_type=args.optimizer,
+        scheduler_type=args.scheduler,
+        scheduler_config=scheduler_config,
+    )
 
     # Create and run trainer
     trainer = CatModelTrainer(
@@ -239,7 +128,7 @@ def train_single_task(args: argparse.Namespace) -> None:
 
 def train_multitask(args: argparse.Namespace) -> None:
     """Train a multitask model using JSON datasets."""
-    from multitask_trainer import CatMultitaskTrainer
+    from engine.multitask_trainer import CatMultitaskTrainer
 
     logger.info("Loading multitask data from JSON files")
 
@@ -271,7 +160,30 @@ def train_multitask(args: argparse.Namespace) -> None:
         model_config=model_config,
         model_type="multitask",
     )
-    optimizer, scheduler = create_optimizer_and_scheduler(model, args.lr, args.weight_decay)
+
+    # Configure scheduler parameters from config file
+    scheduler_config = {
+        "patience": args.scheduler_patience,
+        "factor": args.scheduler_factor,
+        "min_lr": args.scheduler_min_lr,
+        "step_size": args.scheduler_step_size,
+        "gamma": args.scheduler_gamma,
+        "T_max": getattr(args, "scheduler_t_max", 10),
+    }
+
+    # Log optimizer and scheduler configuration from config file
+    logger.info(f"Using optimizer configuration from config file: {args.optimizer}")
+    logger.info(f"Using scheduler configuration from config file: {args.scheduler}")
+
+    # Create optimizer and scheduler
+    optimizer, scheduler = create_optimizer_and_scheduler(
+        model,
+        args.lr,
+        args.weight_decay,
+        optimizer_type=args.optimizer,
+        scheduler_type=args.scheduler,
+        scheduler_config=scheduler_config,
+    )
 
     # Create and run trainer
     trainer = CatMultitaskTrainer(
@@ -283,7 +195,7 @@ def train_multitask(args: argparse.Namespace) -> None:
         checkpoint_dir=args.checkpoint_dir,
         breed_weight=args.breed_weight,
         emotion_weight=args.emotion_weight,
-        loss_type="cross_entropy",
+        loss_type="focal" if args.mode == "multitask" else "cross_entropy",
         lr_scheduler=scheduler,
         use_tensorboard=getattr(args, "use_tensorboard", True),
     )
@@ -308,9 +220,24 @@ def load_test_data(args: argparse.Namespace) -> Dict[str, any]:
     }
 
     if args.mode == "multitask":
-        return get_multitask_data_loaders_from_json(**data_loader_kwargs)
+        data_loaders = get_multitask_data_loaders_from_json(**data_loader_kwargs)
+
+        # Log what we loaded
+        breed_classes = data_loaders.get("breed_classes", [])
+        emotion_classes = data_loaders.get("emotion_classes", [])
+        logger.info(
+            f"Loaded multitask data with {len(breed_classes)} breed classes and {len(emotion_classes)} emotion classes"
+        )
+
+        return data_loaders
     else:
-        return get_single_task_data_loaders_from_json(task=args.mode, **data_loader_kwargs)
+        data_loaders = get_single_task_data_loaders_from_json(task=args.mode, **data_loader_kwargs)
+
+        # Log what we loaded
+        class_names = data_loaders.get("class_names", [])
+        logger.info(f"Loaded {args.mode} data with {len(class_names)} classes")
+
+        return data_loaders
 
 
 def load_evaluation_model(args: argparse.Namespace, model_path: str, data_loaders: Dict[str, any]):
@@ -349,17 +276,59 @@ def evaluate(args: argparse.Namespace) -> None:
     evaluator = Evaluator(
         model=model, test_loader=data_loaders["test"], device=args.device, output_dir=output_dir
     )
-    results = evaluator.evaluate(class_names=class_names)
+
+    # Choose evaluation method based on mode
+    if args.mode == "multitask":
+        logger.info("Evaluating in multitask mode for both breed and emotion tasks")
+
+        # Get breed and emotion class names using our helper function
+        breed_classes, emotion_classes = get_multitask_class_names(args, model_dir)
+
+        # Validate class lists
+        if not breed_classes or not emotion_classes:
+            logger.error("Missing breed or emotion classes for multitask evaluation")
+            sys.exit(1)
+
+        logger.info(
+            f"Evaluating with {len(breed_classes)} breed classes and {len(emotion_classes)} emotion classes"
+        )
+        results = evaluator.evaluate_multitask(
+            breed_classes=breed_classes, emotion_classes=emotion_classes
+        )
+    else:
+        logger.info(f"Evaluating in single-task mode for {args.mode} task")
+        results = evaluator.evaluate(class_names=class_names, task=args.mode)
 
     # Log key metrics
-    metrics = ["accuracy", "f1_score", "top3_accuracy"]
-    logger.info("Evaluation Summary:")
-    for metric in metrics:
-        if metric in results:
-            logger.info(f"{metric.replace('_', ' ').title()}: {results[metric]:.4f}")
+    if args.mode == "multitask":
+        # For multitask, metrics are nested under 'breed' and 'emotion' keys
+        for task in ["breed", "emotion"]:
+            if task in results:
+                task_results = results[task]
+                metrics = ["accuracy", "f1_score", "top3_accuracy"]
+                logger.info(f"{task.capitalize()} Evaluation Summary:")
+                for metric in metrics:
+                    if metric in task_results:
+                        logger.info(
+                            f"  {metric.replace('_', ' ').title()}: {task_results[metric]:.4f}"
+                        )
 
-    if "avg_inference_time_ms" in results:
-        logger.info(f"Average Inference Time: {results['avg_inference_time_ms']:.2f} ms/sample")
+        if "avg_inference_time_ms" in results:
+            logger.info(
+                f"Average Inference Time: {results['avg_inference_time_ms']:.2f} ms/sample"
+            )
+    else:
+        # For single task, metrics are at the top level
+        metrics = ["accuracy", "f1_score", "top3_accuracy"]
+        logger.info("Evaluation Summary:")
+        for metric in metrics:
+            if metric in results:
+                logger.info(f"{metric.replace('_', ' ').title()}: {results[metric]:.4f}")
+
+        if "avg_inference_time_ms" in results:
+            logger.info(
+                f"Average Inference Time: {results['avg_inference_time_ms']:.2f} ms/sample"
+            )
 
 
 def validate_input_path(path: str, file_type: str) -> None:
@@ -439,7 +408,6 @@ def get_model_path_and_classes(args: argparse.Namespace) -> tuple[Path, Path, Li
     # Handle direct model path
     if not model_path and args.model_path:
         model_path = Path(args.model_path)
-        print(model_path)
         if model_path.exists():
             model_dir = model_path.parent
             logger.info(f"Using specified model: {os.path.relpath(model_path)}")
@@ -466,11 +434,11 @@ def get_model_path_and_classes(args: argparse.Namespace) -> tuple[Path, Path, Li
             model_path = model_dir / "last_state.pth"
 
         if not model_path.exists():
-            logger.error(f"No model checkpoint files found in {model_dir.relative_to(Path.cwd())}")
+            logger.error(f"No model checkpoint files found in {os.path.relpath(model_dir)}")
             sys.exit(1)
 
         logger.info(f"Using latest model: {os.path.relpath(model_path)}")
-    print(model_dir)
+
     # Load class names
     class_names_path = Path(model_dir) / "class_names.json"
     if class_names_path.exists():
@@ -506,6 +474,78 @@ def load_class_names_from_json(args: argparse.Namespace) -> List[str]:
     except Exception as e:
         logger.error(f"Could not load class names from JSON dataset: {e}")
         return []
+
+
+def get_multitask_class_names(
+    args: argparse.Namespace, model_dir: Path
+) -> Tuple[List[str], List[str]]:
+    """Get breed and emotion class names for multitask evaluation.
+
+    Args:
+        args: Command-line arguments
+        model_dir: Directory containing the model checkpoint
+
+    Returns:
+        Tuple of (breed_class_names, emotion_class_names)
+    """
+    # Try to load class names from model directory
+    breed_classes = []
+    emotion_classes = []
+
+    # Look for breed class names
+    breed_class_path = model_dir / "class_names.json"
+    if breed_class_path.exists():
+        try:
+            with breed_class_path.open("r") as f:
+                breed_classes = json.load(f)
+            logger.info(f"Loaded {len(breed_classes)} breed classes from model directory")
+        except Exception as e:
+            logger.warning(f"Failed to load breed classes from {breed_class_path}: {e}")
+
+    # Look for emotion class names
+    emotion_class_path = model_dir / "emotion_class_names.json"
+    if emotion_class_path.exists():
+        try:
+            with emotion_class_path.open("r") as f:
+                emotion_classes = json.load(f)
+            logger.info(f"Loaded {len(emotion_classes)} emotion classes from model directory")
+        except Exception as e:
+            logger.warning(f"Failed to load emotion classes from {emotion_class_path}: {e}")
+
+    # If either class list is missing, try to load from JSON dataset
+    if not breed_classes or not emotion_classes:
+        try:
+            with Path(args.train_json).open("r") as f:
+                train_data = json.load(f)
+
+            metadata = train_data.get("metadata", {})
+            samples = train_data.get("samples", [])
+
+            # Get breed classes if not already loaded
+            if not breed_classes:
+                breed_classes = metadata.get("breed_classes") or sorted(
+                    {s.get("breed_class") for s in samples if "breed_class" in s}
+                )
+                if breed_classes:
+                    logger.info(f"Loaded {len(breed_classes)} breed classes from JSON dataset")
+
+            # Get emotion classes if not already loaded
+            if not emotion_classes:
+                emotion_classes = metadata.get("emotion_classes") or sorted(
+                    {s.get("emotion_class") for s in samples if "emotion_class" in s}
+                )
+                if emotion_classes:
+                    logger.info(f"Loaded {len(emotion_classes)} emotion classes from JSON dataset")
+
+        except Exception as e:
+            logger.warning(f"Failed to load class names from JSON dataset: {e}")
+
+    # If emotion classes are still missing, use default emotion classes as fallback
+    if not emotion_classes:
+        emotion_classes = ["angry", "happy", "neutral", "sad", "surprise"]
+        logger.warning(f"Using default emotion classes: {emotion_classes}")
+
+    return breed_classes, emotion_classes
 
 
 def validate_json_datasets(args: argparse.Namespace) -> None:

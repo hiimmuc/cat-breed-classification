@@ -200,5 +200,7 @@ __pycache__/
 .cursorindexingignore
 data/
 src/checkpoints/*
+*.jpg
+*.MOV
 *.zip
 *.tar.gz

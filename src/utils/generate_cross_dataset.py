@@ -12,7 +12,7 @@ import yaml
 from PIL import Image
 from tqdm import tqdm
 
-from model import load_model
+from engine.model import load_model
 
 # Configure logging
 logging.basicConfig(
@@ -48,16 +48,16 @@ class EmotionDatasetGenerator:
         """
         self.config = config
         pipeline_config = config["pipeline"]
-        emotion_model_config = config["model_config"]["emotion"]
+        emotion_model_config = config["model_config"]["single"]["emotion"]
 
         self.device = pipeline_config["device"] if torch.cuda.is_available() else "cpu"
         self.img_size = pipeline_config["img_size"]
 
         # Load class names
-        with open(config["class_names"]["emotion_classes"], "r") as f:
+        with open(config["class_names"]["single"]["emotion_classes"], "r") as f:
             self.emotion_classes = json.load(f)
 
-        with open(config["class_names"]["breed_classes"], "r") as f:
+        with open(config["class_names"]["single"]["breed_classes"], "r") as f:
             self.breed_classes = json.load(f)
 
         self.breed_data_root = Path(config["data"]["breed_data_root"])
@@ -355,8 +355,8 @@ def main():
     # Load configuration
     config = load_pipeline_config()
 
-    logger.info(f"Emotion classes: {config['class_names']['emotion_classes']}")
-    logger.info(f"Breed classes: {config['class_names']['breed_classes']}")
+    logger.info(f"Emotion classes: {config['class_names']['single']['emotion_classes']}")
+    logger.info(f"Breed classes: {config['class_names']['single']['breed_classes']}")
 
     # Initialize generator
     generator = EmotionDatasetGenerator(config)

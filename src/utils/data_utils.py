@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 def print_dataset_stats(data_loaders: Dict[str, Any]) -> None:
     """Print concise dataset statistics."""
-    train_loader, val_loader, test_loader = data_loaders["train"], data_loaders["val"], data_loaders["test"]
+    train_loader, val_loader, test_loader = (
+        data_loaders["train"],
+        data_loaders["val"],
+        data_loaders["test"],
+    )
     class_names = data_loaders["class_names"]
 
     # Quick class distribution count
@@ -35,9 +39,11 @@ def print_dataset_stats(data_loaders: Dict[str, Any]) -> None:
     print(f"\n� Dataset Summary �")
     print(f"{'='*50}")
     print(f"Classes: {len(class_names)} | Total samples: {total_samples}")
-    print(f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}")
+    print(
+        f"Train: {len(train_loader.dataset)} | Val: {len(val_loader.dataset)} | Test: {len(test_loader.dataset)}"
+    )
     print(f"Batch size: {train_loader.batch_size}")
-    
+
     # Show top classes
     if class_counts:
         top_classes = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -47,16 +53,16 @@ def print_dataset_stats(data_loaders: Dict[str, Any]) -> None:
 
 def print_training_config(config: Dict[str, Any]) -> None:
     """Print training configuration in a concise format."""
-    print(f"\n⚙️ Training Configuration ⚙️")
+    print(f"\n⚙️  Training Configuration ⚙️")
     print(f"{'='*50}")
-    
+
     # Group and format key config items
     important_keys = ["backbone", "epochs", "batch_size", "learning_rate", "device"]
     config_items = [f"{key}: {config.get(key, 'N/A')}" for key in important_keys if key in config]
-    
+
     for item in config_items:
         print(f"  {item}")
-    
+
     print(f"{'='*50}\n")
 
 
@@ -218,6 +224,7 @@ def get_data_loaders(
     batch_size: int = 32,
     num_workers: int = 4,
     img_size: int = 224,
+    augment_data: bool = True,
 ) -> Dict[str, DataLoader]:
     """
     Create data loaders for training, validation and testing.
@@ -239,16 +246,26 @@ def get_data_loaders(
         raise ValueError("Either json_dir or data_dir must be provided")
 
     # Define transforms
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((img_size + 32, img_size + 32)),
-            transforms.RandomCrop(img_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    if augment_data:
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+    else:
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
     val_test_transform = transforms.Compose(
         [
